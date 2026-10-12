@@ -16,6 +16,8 @@ public sealed class OptionsValidationTests
     [InlineData("MinimumSuccessRatio", "1.5")]
     [InlineData("FailureCooldownSeconds", "-1")]
     [InlineData("MaxStalenessSeconds", "60")]
+    [InlineData("RefreshTimeoutSeconds", "0")]
+    [InlineData("OnDemandWaitSeconds", "0")]
     public void GivenAnInvalidStoryCacheSetting_WhenOptionsAreValidated_ThenValidationNamesTheSetting(
         string setting,
         string value)
@@ -114,6 +116,53 @@ public sealed class OptionsValidationTests
         Assert.Contains(setting, exception.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("KnownProxies:0", "not-an-address")]
+    [InlineData("KnownNetworks:0", "10.0.0.0")]
+    [InlineData("KnownNetworks:0", "10.0.0.0/33")]
+    [InlineData("ForwardLimit", "0")]
+    public void GivenAnInvalidForwardedHeadersSetting_WhenOptionsAreValidated_ThenValidationNamesTheSetting(
+        string setting,
+        string value)
+    {
+        // Given
+        using var services = CreateServices(new Dictionary<string, string?>
+        {
+            [$"ForwardedHeaders:{setting}"] = value
+        });
+
+        // When
+        var exception = Assert.Throws<OptionsValidationException>(
+            () => services.GetRequiredService<IOptions<TrustedProxyOptions>>().Value);
+
+        // Then
+        Assert.Contains(setting.Split(':')[0], exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GivenTrustedProxies_WhenForwardedHeaderOptionsAreBuilt_ThenOnlyThoseProxiesAreAddedToTheDefaults()
+    {
+        // Given
+        using var services = CreateServices(new Dictionary<string, string?>
+        {
+            ["ForwardedHeaders:KnownProxies:0"] = "10.0.0.4",
+            ["ForwardedHeaders:KnownNetworks:0"] = "10.1.0.0/16",
+            ["ForwardedHeaders:ForwardLimit"] = "2"
+        });
+
+        // When
+        var options = services.GetRequiredService<IOptions<Microsoft.AspNetCore.Builder.ForwardedHeadersOptions>>().Value;
+
+        // Then
+        Assert.Contains(System.Net.IPAddress.Parse("10.0.0.4"), options.KnownProxies);
+        Assert.Contains(System.Net.IPNetwork.Parse("10.1.0.0/16"), options.KnownIPNetworks);
+        Assert.Equal(2, options.ForwardLimit);
+        Assert.Equal(
+            Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor |
+            Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto,
+            options.ForwardedHeaders);
+    }
+
     [Fact]
     public void GivenTheDefaultConfiguration_WhenOptionsAreValidated_ThenTheyAreValid()
     {
@@ -126,6 +175,7 @@ public sealed class OptionsValidationTests
             _ = services.GetRequiredService<IOptions<StoryCacheOptions>>().Value;
             _ = services.GetRequiredService<IOptions<DistributedCacheOptions>>().Value;
             _ = services.GetRequiredService<IOptions<RateLimitingOptions>>().Value;
+            _ = services.GetRequiredService<IOptions<TrustedProxyOptions>>().Value;
         });
 
         // Then

@@ -23,6 +23,12 @@ namespace BestStories.Api.Application;
 /// lock is held). After a failed refresh, on-demand requests that need one fail fast for
 /// <see cref="StoryCacheOptions.FailureCooldown"/> rather than retrying the upstream on every request.
 /// </para>
+/// <para>
+/// Every refresh is bounded by <see cref="StoryCacheOptions.RefreshTimeout"/> and abandoned if the
+/// refresh lock is lost, and an on-demand request waits at most
+/// <see cref="StoryCacheOptions.OnDemandWait"/> for it; the refresh carries on in the background
+/// after a waiting request gives up.
+/// </para>
 /// </remarks>
 public sealed partial class StoryProvider(
     StorySnapshotBuilder snapshotBuilder,
@@ -80,7 +86,7 @@ public sealed partial class StoryProvider(
     private async Task<StorySnapshot> GetSnapshotCoreAsync(CancellationToken cancellationToken)
     {
         var settings = options.Value;
-        var snapshot = await storyCache.GetSnapshotAsync(cancellationToken);
+        var snapshot = await ReadSnapshotAsync(cancellationToken);
         var age = snapshot?.AgeAt(timeProvider.GetUtcNow());
 
         if (snapshot is not null && age < settings.FreshFor)
@@ -114,22 +120,24 @@ public sealed partial class StoryProvider(
             throw new StoryDataUnavailableException("A recent refresh failed; waiting before trying again.");
         }
 
-        await GetOrStartRefresh(RefreshTrigger.OnDemand).WaitAsync(cancellationToken);
+        try
+        {
+            await GetOrStartRefresh(RefreshTrigger.OnDemand)
+                .WaitAsync(settings.OnDemandWait, timeProvider, cancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            StoryTelemetry.OnDemandWaitTimeouts.Add(1);
+            LogOnDemandWaitTimedOut(logger, settings.OnDemandWait.TotalSeconds);
+            throw new StoryDataUnavailableException(
+                "The story refresh did not finish in time; it continues in the background.");
+        }
 
-        return await storyCache.GetSnapshotAsync(cancellationToken)
+        return await ReadSnapshotAsync(cancellationToken)
             ?? throw new StoryDataUnavailableException("The story cache is not available.");
     }
 
-    private void StartBackgroundRefresh()
-    {
-        // The refresh logs its own failures; observing the task here stops an unobserved
-        // exception from surfacing on the finalizer thread.
-        _ = GetOrStartRefresh(RefreshTrigger.Background).ContinueWith(
-            static task => _ = task.Exception,
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
-    }
+    private void StartBackgroundRefresh() => _ = GetOrStartRefresh(RefreshTrigger.Background);
 
     private Task GetOrStartRefresh(RefreshTrigger trigger)
     {
@@ -146,6 +154,16 @@ public sealed partial class StoryProvider(
             // The refresh is shared by every waiting request, so it is bound to application
             // shutdown rather than to any one request, and runs outside the lock.
             _refreshTask = Task.Run(() => RefreshWithLockAsync(trigger, stoppingToken), CancellationToken.None);
+
+            // The refresh logs its own failures, and callers may stop waiting before it finishes
+            // (background refreshes and timed-out on-demand waits). Observing the task here stops
+            // an unobserved exception from surfacing on the finalizer thread.
+            _ = _refreshTask.ContinueWith(
+                static task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+
             return _refreshTask;
         }
     }
@@ -177,7 +195,7 @@ public sealed partial class StoryProvider(
                             return;
                         }
 
-                        await RefreshCoreAsync(trigger, cancellationToken);
+                        await RefreshUnderLeaseAsync(trigger, lease.LeaseLost, cancellationToken);
                         return;
                     }
                 }
@@ -220,7 +238,36 @@ public sealed partial class StoryProvider(
         }
     }
 
-    private async Task RefreshCoreAsync(RefreshTrigger trigger, CancellationToken cancellationToken)
+    /// <summary>
+    /// Runs the refresh until it completes, the refresh timeout passes, the lease is lost or the
+    /// application stops, whichever comes first.
+    /// </summary>
+    private async Task RefreshUnderLeaseAsync(
+        RefreshTrigger trigger,
+        CancellationToken leaseLost,
+        CancellationToken stoppingToken)
+    {
+        var timeout = options.Value.RefreshTimeout;
+        using var deadline = new CancellationTokenSource(timeout, timeProvider);
+        using var refresh = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, leaseLost, deadline.Token);
+
+        try
+        {
+            await RefreshCoreAsync(trigger, refresh.Token, stoppingToken);
+        }
+        catch (StoryDataUnavailableException) when (
+            deadline.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
+        {
+            StoryTelemetry.RefreshTimeouts.Add(1, StoryTelemetry.Tag("trigger", TriggerName(trigger)));
+            LogRefreshTimedOut(logger, timeout.TotalSeconds, TriggerName(trigger));
+            throw;
+        }
+    }
+
+    private async Task RefreshCoreAsync(
+        RefreshTrigger trigger,
+        CancellationToken cancellationToken,
+        CancellationToken stoppingToken)
     {
         var triggerName = TriggerName(trigger);
         var startedAt = timeProvider.GetTimestamp();
@@ -231,6 +278,7 @@ public sealed partial class StoryProvider(
         {
             var snapshot = await snapshotBuilder.BuildAsync(cancellationToken);
             await storyCache.SetSnapshotAsync(snapshot, cancellationToken);
+            StoryTelemetry.ObserveSnapshot(snapshot.PublishedAt);
             ClearFailure();
 
             activity?.SetTag("stories.count", snapshot.Stories.Count);
@@ -242,7 +290,7 @@ public sealed partial class StoryProvider(
             StoryTelemetry.StoriesPerRefresh.Record(snapshot.Stories.Count);
             LogRefreshed(logger, snapshot.Stories.Count, triggerName);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
             activity?.SetStatus(ActivityStatusCode.Error, "Refresh cancelled during application shutdown.");
             throw;
@@ -265,9 +313,21 @@ public sealed partial class StoryProvider(
         }
     }
 
-    private async Task<bool> IsFreshAsync(TimeSpan freshFor, CancellationToken cancellationToken)
+    /// <summary>Reads the shared snapshot and records its publication time for the age gauge.</summary>
+    private async Task<StorySnapshot?> ReadSnapshotAsync(CancellationToken cancellationToken)
     {
         var snapshot = await storyCache.GetSnapshotAsync(cancellationToken);
+        if (snapshot is not null)
+        {
+            StoryTelemetry.ObserveSnapshot(snapshot.PublishedAt);
+        }
+
+        return snapshot;
+    }
+
+    private async Task<bool> IsFreshAsync(TimeSpan freshFor, CancellationToken cancellationToken)
+    {
+        var snapshot = await ReadSnapshotAsync(cancellationToken);
         return snapshot is not null && snapshot.AgeAt(timeProvider.GetUtcNow()) < freshFor;
     }
 
@@ -308,6 +368,16 @@ public sealed partial class StoryProvider(
         Level = LogLevel.Information,
         Message = "Skipping the scheduled refresh because another instance holds the refresh lock.")]
     private static partial void LogScheduledRefreshSkipped(ILogger logger);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "A request stopped waiting for the story refresh after {WaitSeconds} seconds; the refresh continues.")]
+    private static partial void LogOnDemandWaitTimedOut(ILogger logger, double waitSeconds);
+
+    [LoggerMessage(
+        Level = LogLevel.Error,
+        Message = "The best-stories refresh did not finish within {TimeoutSeconds} seconds and was abandoned. Trigger: {RefreshTrigger}.")]
+    private static partial void LogRefreshTimedOut(ILogger logger, double timeoutSeconds, string refreshTrigger);
 
     [LoggerMessage(
         Level = LogLevel.Information,

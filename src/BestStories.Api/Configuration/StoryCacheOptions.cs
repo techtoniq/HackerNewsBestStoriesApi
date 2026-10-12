@@ -36,6 +36,18 @@ public sealed class StoryCacheOptions
     /// </summary>
     public int FailureCooldownSeconds { get; set; } = 30;
 
+    /// <summary>
+    /// The longest a single refresh may run before it is abandoned and counted as a failure. It
+    /// bounds how long an upstream that is slow, rather than failing, can hold the refresh lock.
+    /// </summary>
+    public int RefreshTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// How long an on-demand request waits for a refresh before returning <c>503</c>. The refresh
+    /// itself carries on, so a later request can still be served from it.
+    /// </summary>
+    public int OnDemandWaitSeconds { get; set; } = 10;
+
     /// <summary>The longest wait between retries of the initial load in automatic mode.</summary>
     public int InitialLoadMaxRetryDelaySeconds { get; set; } = 30;
 
@@ -49,6 +61,10 @@ public sealed class StoryCacheOptions
     public TimeSpan MaxStaleness => TimeSpan.FromSeconds(MaxStalenessSeconds);
 
     public TimeSpan FailureCooldown => TimeSpan.FromSeconds(FailureCooldownSeconds);
+
+    public TimeSpan RefreshTimeout => TimeSpan.FromSeconds(RefreshTimeoutSeconds);
+
+    public TimeSpan OnDemandWait => TimeSpan.FromSeconds(OnDemandWaitSeconds);
 
     /// <summary>How long a snapshot counts as fresh in the configured refresh mode.</summary>
     public TimeSpan FreshFor => AutomaticRefresh ? RefreshInterval : CacheTtl;

@@ -41,7 +41,7 @@ public sealed class StoryCacheHealthCheckTests
     }
 
     [Fact]
-    public async Task GivenAutomaticRefreshWithASnapshotBeyondMaxStaleness_WhenReadinessIsChecked_ThenUnhealthyIsReported()
+    public async Task GivenAutomaticRefreshWithASnapshotBeyondMaxStaleness_WhenReadinessIsChecked_ThenDegradedIsReported()
     {
         // Given
         await PublishAsync(age: TimeSpan.FromSeconds(1801));
@@ -51,7 +51,9 @@ public sealed class StoryCacheHealthCheckTests
         var result = await CheckAsync(healthCheck);
 
         // Then
-        Assert.Equal(HealthStatus.Unhealthy, result.Status);
+        // Degraded keeps the instance in rotation: staleness is an upstream problem shared by
+        // every instance, and the API answers story requests with its own 503 meanwhile.
+        Assert.Equal(HealthStatus.Degraded, result.Status);
     }
 
     [Fact]

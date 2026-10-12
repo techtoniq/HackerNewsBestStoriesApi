@@ -3,7 +3,9 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 using BestStories.Api.Application;
 using BestStories.Api.Domain;
+using BestStories.Api.Infrastructure.Caching;
 using BestStories.Api.IntegrationTests.TestSupport;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -181,6 +183,90 @@ public sealed class ApiEndpointIntegrationTests
     }
 
     [Fact]
+    public async Task GivenAutomaticRefreshWithASnapshotBeyondMaxStaleness_WhenTheApiIsCalled_ThenStoriesAreUnavailableButTheInstanceStaysReady()
+    {
+        // Given
+        var neverCompletes = new TaskCompletionSource();
+        var cache = new InMemoryStoryCache();
+        await cache.SetSnapshotAsync(
+            StorySnapshot.Create(
+                [new Story(1, "Old", "https://example.com/1", "author", DateTimeOffset.UnixEpoch, 10, 0)],
+                DateTimeOffset.UtcNow.AddHours(-2)),
+            TestContext.Current.CancellationToken);
+        await using var factory = new BestStoriesApiFactory(
+            new Dictionary<string, string?> { ["StoryCache:AutomaticRefresh"] = "true" },
+            services =>
+            {
+                services.RemoveAll<IStoryCache>();
+                services.AddSingleton<IStoryCache>(cache);
+            });
+        factory.HackerNews.Gate = neverCompletes.Task;
+        using var client = factory.CreateClient();
+
+        // When
+        using var stories = await client.GetAsync("/api/stories/best?n=1", TestContext.Current.CancellationToken);
+        using var readiness = await client.GetAsync("/health/ready", TestContext.Current.CancellationToken);
+
+        // Then
+        await AssertProblemDetailsAsync(stories, HttpStatusCode.ServiceUnavailable);
+        Assert.NotNull(stories.Headers.RetryAfter);
+        Assert.Equal(HttpStatusCode.OK, readiness.StatusCode);
+        using var document = await ReadJsonAsync(readiness);
+        Assert.Equal("degraded", document.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task GivenATrustedProxy_WhenClientsBehindItExceedTheRateLimit_ThenEachClientIsLimitedSeparately()
+    {
+        // Given
+        await using var factory = CreateFactoryWithStories(
+            storyCount: 1,
+            new Dictionary<string, string?>
+            {
+                ["RateLimiting:PermitLimit"] = "1",
+                ["RateLimiting:WindowSeconds"] = "60",
+                ["ForwardedHeaders:KnownProxies:0"] = "10.0.0.1"
+            },
+            services => services.AddSingleton<IStartupFilter>(
+                new RemoteAddressStartupFilter(IPAddress.Parse("10.0.0.1"))));
+        using var client = factory.CreateClient();
+
+        // When
+        using var firstClient = await GetStoriesForwardedForAsync(client, "203.0.113.1");
+        using var secondClient = await GetStoriesForwardedForAsync(client, "203.0.113.2");
+        using var firstClientAgain = await GetStoriesForwardedForAsync(client, "203.0.113.1");
+
+        // Then
+        Assert.Equal(HttpStatusCode.OK, firstClient.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, secondClient.StatusCode);
+        await AssertProblemDetailsAsync(firstClientAgain, HttpStatusCode.TooManyRequests);
+    }
+
+    [Fact]
+    public async Task GivenAnUntrustedSender_WhenItSendsForwardedHeaders_ThenTheyAreIgnoredForRateLimiting()
+    {
+        // Given
+        await using var factory = CreateFactoryWithStories(
+            storyCount: 1,
+            new Dictionary<string, string?>
+            {
+                ["RateLimiting:PermitLimit"] = "1",
+                ["RateLimiting:WindowSeconds"] = "60"
+            },
+            services => services.AddSingleton<IStartupFilter>(
+                new RemoteAddressStartupFilter(IPAddress.Parse("198.51.100.9"))));
+        using var client = factory.CreateClient();
+
+        // When
+        using var first = await GetStoriesForwardedForAsync(client, "203.0.113.1");
+        using var spoofed = await GetStoriesForwardedForAsync(client, "203.0.113.2");
+
+        // Then
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        await AssertProblemDetailsAsync(spoofed, HttpStatusCode.TooManyRequests);
+    }
+
+    [Fact]
     public async Task GivenOnDemandRefresh_WhenHealthEndpointsAreCalled_ThenLivenessAndReadinessAreSuccessful()
     {
         // Given
@@ -237,9 +323,10 @@ public sealed class ApiEndpointIntegrationTests
 
     private static BestStoriesApiFactory CreateFactoryWithStories(
         int storyCount,
-        IReadOnlyDictionary<string, string?>? settings = null)
+        IReadOnlyDictionary<string, string?>? settings = null,
+        Action<IServiceCollection>? configureServices = null)
     {
-        var factory = new BestStoriesApiFactory(settings);
+        var factory = new BestStoriesApiFactory(settings, configureServices);
         factory.HackerNews.BestStoryIds = Enumerable.Range(1, storyCount).ToArray();
         foreach (var id in factory.HackerNews.BestStoryIds)
         {
@@ -247,6 +334,13 @@ public sealed class ApiEndpointIntegrationTests
         }
 
         return factory;
+    }
+
+    private static async Task<HttpResponseMessage> GetStoriesForwardedForAsync(HttpClient client, string clientAddress)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/stories/best?n=1");
+        request.Headers.Add("X-Forwarded-For", clientAddress);
+        return await client.SendAsync(request, TestContext.Current.CancellationToken);
     }
 
     private static async Task<JsonDocument> ReadJsonAsync(HttpResponseMessage response)

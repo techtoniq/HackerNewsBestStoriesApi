@@ -10,6 +10,8 @@ builder.Services.AddBestStoriesObservability(builder.Configuration);
 
 var app = builder.Build();
 
+// First, so that everything after it (rate limiting, error handling, logging) sees the real client address.
+app.UseForwardedHeaders();
 app.UseApiResponseHeaders();
 app.UseExceptionHandler();
 app.UseApiStatusCodePages();

@@ -97,6 +97,30 @@ public sealed class RedisRefreshLockTests(RedisFixture redis)
         Assert.Null(refused);
     }
 
+    [Fact]
+    public async Task GivenALeaseThatWasTakenOver_WhenTheOldOwnerNextRenews_ThenItIsToldTheLeaseIsLost()
+    {
+        // Given
+        var first = CreateLock(leaseSeconds: 1);
+        var second = CreateLock();
+        await using var original = await first.TryAcquireAsync(TestContext.Current.CancellationToken);
+        Assert.NotNull(original);
+        await redis.Connection.GetDatabase().KeyDeleteAsync(first.Key);
+        await using var current = await second.TryAcquireAsync(TestContext.Current.CancellationToken);
+
+        // When
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (!original.LeaseLost.IsCancellationRequested && DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        }
+
+        // Then
+        Assert.NotNull(current);
+        Assert.True(original.LeaseLost.IsCancellationRequested);
+        Assert.False(current.LeaseLost.IsCancellationRequested);
+    }
+
     private RedisRefreshLock CreateLock(int leaseSeconds = 30) =>
         new(
             redis.Connection,
