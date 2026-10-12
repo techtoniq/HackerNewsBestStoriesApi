@@ -1,13 +1,19 @@
-using System.Text.Json;
+using System.Globalization;
 using System.Text.Json.Serialization;
-using BestStories.Api.Models;
-using BestStories.Api.Services;
+using BestStories.Api.Application;
+using BestStories.Api.Domain;
 
 namespace BestStories.Api.Integrations.HackerNews.V0;
 
-public sealed class HackerNewsV0Client(HttpClient httpClient) : IHackerNewsClient
+/// <summary>Reads best stories from version 0 of the Hacker News Firebase API.</summary>
+/// <remarks>
+/// Transient failures, timeouts and circuit breaking are handled by the resilience pipeline
+/// registered on the typed <see cref="HttpClient"/>, not here.
+/// </remarks>
+public sealed partial class HackerNewsV0Client(
+    HttpClient httpClient,
+    ILogger<HackerNewsV0Client> logger) : IHackerNewsClient
 {
-    public const int RequestTimeoutSeconds = 15;
     public static readonly Uri ApiBaseAddress = new("https://hacker-news.firebaseio.com/v0/");
 
     public async Task<IReadOnlyList<int>> GetBestStoryIdsAsync(CancellationToken cancellationToken)
@@ -15,17 +21,26 @@ public sealed class HackerNewsV0Client(HttpClient httpClient) : IHackerNewsClien
         var ids = await httpClient.GetFromJsonAsync<int[]>("beststories.json", cancellationToken)
             ?? throw new InvalidDataException("Hacker News returned an empty best-stories response.");
 
-        if (ids.Length > StoryLimits.MaximumCount || ids.Any(id => id <= 0))
+        var validIds = ids.Where(id => id > 0).Distinct().ToArray();
+        if (validIds.Length < ids.Length)
         {
-            throw new InvalidDataException("Hacker News returned an invalid best-stories list.");
+            LogInvalidOrDuplicateIds(logger, ids.Length - validIds.Length);
         }
 
-        return ids.Distinct().ToArray();
+        if (validIds.Length > StoryLimits.MaximumCount)
+        {
+            LogListTruncated(logger, validIds.Length, StoryLimits.MaximumCount);
+            validIds = validIds[..StoryLimits.MaximumCount];
+        }
+
+        return validIds;
     }
 
-    public async Task<StoryResponse?> GetStoryAsync(int id, CancellationToken cancellationToken)
+    public async Task<Story?> GetStoryAsync(int id, CancellationToken cancellationToken)
     {
-        var item = await httpClient.GetFromJsonAsync<HackerNewsV0Item>($"item/{id}.json", cancellationToken)
+        var item = await httpClient.GetFromJsonAsync<HackerNewsV0Item>(
+                string.Create(CultureInfo.InvariantCulture, $"item/{id}.json"),
+                cancellationToken)
             ?? throw new InvalidDataException($"Hacker News returned no item for story {id}.");
 
         if (item.Id != id)
@@ -46,28 +61,39 @@ public sealed class HackerNewsV0Client(HttpClient httpClient) : IHackerNewsClien
             throw new InvalidDataException($"Hacker News returned incomplete details for story {id}.");
         }
 
-        DateTimeOffset time;
+        DateTimeOffset postedAt;
         try
         {
-            time = DateTimeOffset.FromUnixTimeSeconds(item.Time.Value);
+            postedAt = DateTimeOffset.FromUnixTimeSeconds(item.Time.Value);
         }
         catch (ArgumentOutOfRangeException exception)
         {
             throw new InvalidDataException($"Hacker News returned an invalid time for story {id}.", exception);
         }
 
-        var uri = string.IsNullOrWhiteSpace(item.Url)
-            ? $"https://news.ycombinator.com/item?id={id}"
+        var url = string.IsNullOrWhiteSpace(item.Url)
+            ? string.Create(CultureInfo.InvariantCulture, $"https://news.ycombinator.com/item?id={id}")
             : item.Url;
 
-        return new StoryResponse(
+        return new Story(
+            id,
             item.Title,
-            uri,
+            url,
             item.By,
-            time,
+            postedAt,
             item.Score.Value,
             item.Descendants ?? 0);
     }
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Ignored {IgnoredCount} non-positive or duplicate IDs in the Hacker News best-stories list.")]
+    private static partial void LogInvalidOrDuplicateIds(ILogger logger, int ignoredCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Hacker News returned {ReturnedCount} best-story IDs; using the first {MaximumCount}.")]
+    private static partial void LogListTruncated(ILogger logger, int returnedCount, int maximumCount);
 
     private sealed class HackerNewsV0Item
     {

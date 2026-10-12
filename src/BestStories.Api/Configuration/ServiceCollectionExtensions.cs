@@ -1,103 +1,97 @@
+using BestStories.Api.Application;
+using BestStories.Api.Endpoints;
+using BestStories.Api.Infrastructure.Caching;
 using BestStories.Api.Integrations.HackerNews.V0;
-using BestStories.Api.Models;
-using BestStories.Api.Services;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
 namespace BestStories.Api.Configuration;
 
 public static class ServiceCollectionExtensions
 {
+    /// <summary>Registers story retrieval, caching, refresh scheduling and readiness.</summary>
     public static IServiceCollection AddBestStories(
         this IServiceCollection services,
         IConfiguration configuration)
     {
-        var configuredConcurrency = Math.Max(
-            1,
-            configuration.GetValue<int?>("StoryCache:MaxConcurrentRequests") ??
-            new StoryCacheOptions().MaxConcurrentRequests);
-        var minimumRefreshLockLeaseSeconds =
-            HackerNewsV0Client.RequestTimeoutSeconds +
-            (int)Math.Ceiling(
-                StoryLimits.MaximumCount / (double)configuredConcurrency) *
-            HackerNewsV0Client.RequestTimeoutSeconds;
+        ArgumentNullException.ThrowIfNull(configuration);
 
-        services
-            .AddOptions<StoryCacheOptions>()
-            .BindConfiguration("StoryCache")
-            .Validate(options => options.RefreshIntervalSeconds > 0,
-                "RefreshIntervalSeconds must be greater than zero.")
-            .Validate(options => options.CacheTtlSeconds > 0,
-                "CacheTtlSeconds must be greater than zero.")
-            .Validate(options => options.MaxConcurrentRequests > 0,
-                "MaxConcurrentRequests must be greater than zero.")
+        services.TryAddSingleton(TimeProvider.System);
+
+        services.AddOptions<StoryCacheOptions>()
+            .BindConfiguration(StoryCacheOptions.SectionName)
             .ValidateOnStart();
+        services.AddSingleton<IValidateOptions<StoryCacheOptions>, StoryCacheOptionsValidator>();
 
-        services
-            .AddOptions<DistributedCacheOptions>()
-            .BindConfiguration("DistributedCache")
-            .Validate(options =>
-                    options.Provider.Equals("Memory", StringComparison.OrdinalIgnoreCase) ||
-                    options.Provider.Equals("Redis", StringComparison.OrdinalIgnoreCase),
-                "DistributedCache:Provider must be either Memory or Redis.")
-            .Validate(options =>
-                    options.Provider.Equals("Memory", StringComparison.OrdinalIgnoreCase) ||
-                    !string.IsNullOrWhiteSpace(options.RedisConnectionString),
-                "DistributedCache:RedisConnectionString is required when Redis is selected.")
-            .Validate(options => options.LockLeaseSeconds > 0,
-                "LockLeaseSeconds must be greater than zero.")
-            .Validate(options =>
-                    options.Provider.Equals("Memory", StringComparison.OrdinalIgnoreCase) ||
-                    options.LockLeaseSeconds > minimumRefreshLockLeaseSeconds,
-                "Redis LockLeaseSeconds must exceed the maximum bounded upstream refresh duration.")
-            .Validate(options => options.LockWaitSeconds > 0,
-                "LockWaitSeconds must be greater than zero.")
-            .Validate(options => !string.IsNullOrWhiteSpace(options.InstanceName),
-                "DistributedCache:InstanceName is required.")
-            .Validate(options => options.LockPollMilliseconds > 0,
-                "LockPollMilliseconds must be greater than zero.")
+        services.AddOptions<DistributedCacheOptions>()
+            .BindConfiguration(DistributedCacheOptions.SectionName)
             .ValidateOnStart();
+        services.AddSingleton<IValidateOptions<DistributedCacheOptions>, DistributedCacheOptionsValidator>();
 
-        services.AddHttpClient<IHackerNewsClient, HackerNewsV0Client>(client =>
-        {
-            client.BaseAddress = HackerNewsV0Client.ApiBaseAddress;
-            client.Timeout = TimeSpan.FromSeconds(HackerNewsV0Client.RequestTimeoutSeconds);
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("BestStoriesApi/1.0");
-        });
+        AddHackerNewsClient(services);
+        AddStoryCache(services, configuration);
 
-        var cacheOptions = configuration
-            .GetSection("DistributedCache")
-            .Get<DistributedCacheOptions>() ?? new DistributedCacheOptions();
-
-        if (cacheOptions.Provider.Equals("Redis", StringComparison.OrdinalIgnoreCase))
-        {
-            services.AddStackExchangeRedisCache(options =>
-            {
-                options.InstanceName = cacheOptions.InstanceName;
-            });
-            services.AddSingleton<IConnectionMultiplexer>(_ =>
-                ConnectionMultiplexer.Connect(cacheOptions.RedisConnectionString!));
-            services
-                .AddOptions<RedisCacheOptions>()
-                .Configure<IConnectionMultiplexer>((options, multiplexer) =>
-                    options.ConnectionMultiplexerFactory = () => Task.FromResult(multiplexer));
-            services.AddSingleton<IStoryCache, RedisStoryCache>();
-            services.AddSingleton<IDistributedRefreshLock, RedisRefreshLock>();
-        }
-        else
-        {
-            services.AddSingleton<IStoryCache, StoryCache>();
-            services.AddSingleton<IDistributedRefreshLock, InMemoryRefreshLock>();
-        }
-
+        services.AddSingleton<StorySnapshotBuilder>();
         services.AddSingleton<IStoryProvider, StoryProvider>();
-        services.AddSingleton<StoryRefreshService>();
-        services.AddHostedService(serviceProvider =>
-            serviceProvider.GetRequiredService<StoryRefreshService>());
+        services.AddHostedService<StoryRefreshService>();
         services
             .AddHealthChecks()
-            .AddCheck<StoryCacheHealthCheck>("story-cache", tags: ["ready"]);
+            .AddCheck<StoryCacheHealthCheck>("story-cache", tags: [HealthEndpoints.ReadinessTag]);
 
         return services;
+    }
+
+    private static void AddHackerNewsClient(IServiceCollection services)
+    {
+        services
+            .AddHttpClient<IHackerNewsClient, HackerNewsV0Client>(client =>
+            {
+                client.BaseAddress = HackerNewsV0Client.ApiBaseAddress;
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("BestStoriesApi/1.0");
+            })
+            .AddStandardResilienceHandler(resilience =>
+            {
+                // Retries with exponential backoff and jitter for transient failures (5xx, 408,
+                // 429, network errors), a per-attempt timeout, an overall timeout and a circuit
+                // breaker that stops calling Hacker News while it is failing.
+                resilience.Retry.MaxRetryAttempts = 2;
+                resilience.AttemptTimeout.Timeout = TimeSpan.FromSeconds(5);
+                resilience.TotalRequestTimeout.Timeout = TimeSpan.FromSeconds(20);
+            });
+    }
+
+    private static void AddStoryCache(IServiceCollection services, IConfiguration configuration)
+    {
+        // The provider decides which services are registered, so it is read at registration
+        // time; the full options object is still validated at startup.
+        var cacheOptions = configuration
+            .GetSection(DistributedCacheOptions.SectionName)
+            .Get<DistributedCacheOptions>() ?? new DistributedCacheOptions();
+
+        if (cacheOptions.Provider != CacheProvider.Redis)
+        {
+            services.AddSingleton<IStoryCache, InMemoryStoryCache>();
+            services.AddSingleton<IDistributedRefreshLock, InMemoryRefreshLock>();
+            return;
+        }
+
+        services.AddSingleton<IConnectionMultiplexer>(_ =>
+        {
+            var redisConfiguration = ConfigurationOptions.Parse(cacheOptions.RedisConnectionString ?? string.Empty);
+
+            // Start even if Redis is briefly unreachable and keep reconnecting in the
+            // background; readiness reports the outage meanwhile.
+            redisConfiguration.AbortOnConnectFail = false;
+            return ConnectionMultiplexer.Connect(redisConfiguration);
+        });
+        services.AddStackExchangeRedisCache(options => options.InstanceName = cacheOptions.InstanceName);
+        services
+            .AddOptions<RedisCacheOptions>()
+            .Configure<IConnectionMultiplexer>((options, multiplexer) =>
+                options.ConnectionMultiplexerFactory = () => Task.FromResult(multiplexer));
+        services.AddSingleton<IStoryCache, RedisStoryCache>();
+        services.AddSingleton<IDistributedRefreshLock, RedisRefreshLock>();
     }
 }
