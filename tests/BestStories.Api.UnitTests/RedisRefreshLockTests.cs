@@ -53,10 +53,10 @@ public sealed class RedisRefreshLockTests
     }
 
     [Fact]
-    public async Task GivenARedisConnectionFailureOnRelease_WhenTheLeaseIsDisposed_ThenNoExceptionEscapes()
+    public async Task GivenTheConnectionIsDisposedDuringShutdown_WhenTheLeaseIsDisposed_ThenNoExceptionEscapes()
     {
         // Given
-        _redis.Release = () => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "Simulated.");
+        _redis.Release = () => throw new ObjectDisposedException(nameof(IConnectionMultiplexer));
         var lease = await AcquireAsync();
 
         // When
