@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore BestStories.slnx
+
+      - name: Build
+        run: dotnet build BestStories.slnx --configuration Release --no-restore
+
+      # Component tests start a real Redis container through Testcontainers,
+      # using the Docker engine that GitHub-hosted Ubuntu runners provide.
+      - name: Test
+        run: dotnet test --solution BestStories.slnx --configuration Release --no-build
+
+  container-image:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --tag beststories-api:ci .
