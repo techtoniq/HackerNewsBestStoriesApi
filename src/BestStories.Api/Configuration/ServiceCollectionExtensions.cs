@@ -4,6 +4,7 @@ using BestStories.Api.Infrastructure.Caching;
 using BestStories.Api.Integrations.HackerNews.V0;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
@@ -11,6 +12,13 @@ namespace BestStories.Api.Configuration;
 
 public static class ServiceCollectionExtensions
 {
+    /// <summary>
+    /// Bounds the readiness check below the usual 1-second-plus probe budgets once retries are
+    /// counted. Redis reads already give up after <see cref="DistributedCacheOptions.ReadTimeout"/>;
+    /// this is the backstop for anything else that stalls.
+    /// </summary>
+    internal static readonly TimeSpan ReadinessCheckTimeout = TimeSpan.FromSeconds(2);
+
     /// <summary>Registers story retrieval, caching, refresh scheduling and readiness.</summary>
     public static IServiceCollection AddBestStories(
         this IServiceCollection services,
@@ -33,12 +41,18 @@ public static class ServiceCollectionExtensions
         AddHackerNewsClient(services);
         AddStoryCache(services, configuration);
 
+        services.AddSingleton<RefreshSchedule>();
         services.AddSingleton<StorySnapshotBuilder>();
         services.AddSingleton<IStoryProvider, StoryProvider>();
         services.AddHostedService<StoryRefreshService>();
         services
             .AddHealthChecks()
-            .AddCheck<StoryCacheHealthCheck>("story-cache", tags: [HealthEndpoints.ReadinessTag]);
+            .Add(new HealthCheckRegistration(
+                "story-cache",
+                serviceProvider => ActivatorUtilities.CreateInstance<StoryCacheHealthCheck>(serviceProvider),
+                failureStatus: HealthStatus.Unhealthy,
+                tags: [HealthEndpoints.ReadinessTag],
+                timeout: ReadinessCheckTimeout));
 
         return services;
     }

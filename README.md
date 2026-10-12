@@ -32,7 +32,7 @@ docker run --rm -p 8080:8080 beststories-api
 - The result can contain fewer than `n` items when fewer eligible stories exist.
 - Responses carry `ETag`, `Last-Modified` and `Cache-Control: public, max-age=…`. The max-age is whatever remains of the snapshot's freshness, capped at `ClientCacheMaxAgeSeconds` (60 by default). A request with a matching `If-None-Match` receives `304 Not Modified`.
 - `429 Too Many Requests` (with `Retry-After`) when a client exceeds the rate limit.
-- `503 Service Unavailable` (with `Retry-After`) when no snapshot within the maximum staleness is available.
+- `503 Service Unavailable` (with `Retry-After`) when no snapshot within the maximum staleness is available. `Retry-After` reflects the cause: the time left in the failure cooldown, the time until the next scheduled refresh (automatic mode), or 5 seconds when a refresh is still running or no better estimate exists.
 
 The OpenAPI document is served at `/openapi/v1.json`.
 
@@ -48,7 +48,8 @@ The OpenAPI document is served at `/openapi/v1.json`.
 - `GET /health/ready` returns `200` when the instance can handle requests, otherwise a generic `503`:
   - Automatic refresh: ready once a snapshot is available (this instance's initial load, or one another instance published to Redis).
   - On-demand refresh: ready as soon as the story cache is reachable, because the first request populates it.
-  - With Redis configured, Redis availability is part of readiness.
+  - With Redis configured, an instance that already holds a snapshot stays ready while Redis is unavailable (it serves that snapshot); only an instance with nothing to serve reports not ready.
+  - The check times out after 2 seconds and then reports not ready.
   - A snapshot older than `MaxStalenessSeconds` reports `{"status":"degraded"}` with `200`. Story requests return `503` meanwhile, but the instance stays in rotation: staleness comes from Hacker News and affects every instance alike, so failing readiness would only swap the API's `503` (with Problem Details and `Retry-After`) for the load balancer's and stall rolling deployments. Alert on the `beststories.cache.snapshot.age` metric instead.
 
 Use `/health/ready` as the readiness probe and `/health/live` as the liveness probe.
@@ -89,7 +90,7 @@ $env:ForwardedHeaders__KnownNetworks__0 = "10.0.0.0/16"   # for example, the ing
 $env:ForwardedHeaders__ForwardLimit = "1"                   # trusted proxies between client and service
 ```
 
-Deleted and dead stories are excluded. Stories without a URL use their Hacker News item page as `uri`; a missing comment count is returned as zero.
+Deleted and dead stories are excluded. Stories without a URL, or whose URL is not an absolute `http` or `https` URL (for example `javascript:` or `data:`), use their Hacker News item page as `uri`; a missing comment count is returned as zero.
 
 ## Distributed cache (Redis)
 
@@ -116,7 +117,9 @@ With Redis:
 - If a renewal finds another owner holding the lease, or renewals fail (including Redis timeouts) for a whole lease period, the owner abandons its refresh rather than racing the new owner. Failures to renew or release are logged and never fail a refresh that has already published; an unreleased lease simply expires.
 - Scheduled refreshes are skipped when another instance published within the current interval, so a fleet refreshes about once per interval rather than once per instance.
 - On-demand instances that find the lease held poll the shared cache every `LockPollMilliseconds` (200) for up to `LockWaitSeconds` (10), then return `503`.
-- The connection is made with `AbortOnConnectFail = false`, so the API starts while Redis is unreachable and reconnects in the background; readiness reports the outage meanwhile.
+- The connection is made with `AbortOnConnectFail = false`, so the API starts while Redis is unreachable and reconnects in the background.
+- **Redis outages**: each instance keeps the last snapshot it read or wrote. If a Redis read fails or takes longer than `ReadTimeoutMilliseconds` (1000), that snapshot is served instead (still subject to `MaxStalenessSeconds`), and Redis is not tried again for `ReadFailureBackoffMilliseconds` (5000). An outage therefore costs each instance one slow read rather than one per request, and instances keep serving and stay ready. Only an instance that has never held a snapshot fails.
+- A shared snapshot that cannot be deserialized or fails validation (incomplete stories, duplicate IDs, wrong order, more than 500 stories) is treated as missing, so the next refresh replaces it.
 
 Use a private, authenticated, TLS-enabled Redis service in production and supply its connection string as a secret.
 
@@ -132,7 +135,7 @@ Every setting can be overridden with environment variables, for example `StoryCa
 | `StoryCache:MaxStalenessSeconds` | `1800` | Oldest snapshot that is served. Must be at least the freshness window. |
 | `StoryCache:MaxConcurrentRequests` | `8` | Concurrent item requests during a refresh (1–64). |
 | `StoryCache:MinimumSuccessRatio` | `0.95` | Fraction of item requests that must succeed to publish. |
-| `StoryCache:FailureCooldownSeconds` | `30` | Fail-fast period after a failed on-demand refresh; also the `Retry-After` on `503`. |
+| `StoryCache:FailureCooldownSeconds` | `30` | Fail-fast period after a failed on-demand refresh. |
 | `StoryCache:RefreshTimeoutSeconds` | `60` | Longest a single refresh may run before it is abandoned. |
 | `StoryCache:OnDemandWaitSeconds` | `10` | Longest an on-demand request waits for a refresh before returning `503`. |
 | `StoryCache:InitialLoadMaxRetryDelaySeconds` | `30` | Longest backoff between initial-load attempts. |
@@ -144,6 +147,8 @@ Every setting can be overridden with environment variables, for example `StoryCa
 | `DistributedCache:LockWaitSeconds` | `10` | How long an on-demand request waits for another instance's refresh. |
 | `DistributedCache:LockPollMilliseconds` | `200` | Shared-cache polling interval while waiting. |
 | `DistributedCache:LocalCacheMilliseconds` | `1000` | Per-instance reuse of the Redis snapshot (0 disables it). |
+| `DistributedCache:ReadTimeoutMilliseconds` | `1000` | How long a read waits for Redis before serving the instance's last snapshot. |
+| `DistributedCache:ReadFailureBackoffMilliseconds` | `5000` | How long after a failed Redis read the instance serves its last snapshot without retrying Redis. |
 | `RateLimiting:PermitLimit` | `100` | Requests per client address per window. |
 | `RateLimiting:WindowSeconds` | `10` | Rate-limit window. |
 | `ForwardedHeaders:KnownProxies` | | Proxy IP addresses whose forwarded headers are trusted (loopback is always trusted). |
@@ -194,13 +199,20 @@ src/BestStories.Api
 
 Build settings are shared through `Directory.Build.props` (nullable, warnings as errors, .NET analyzers), and package versions are managed centrally in `Directory.Packages.props`.
 
+Builds are reproducible:
+
+- Every project has a `packages.lock.json`, and CI and the container build restore in locked mode, so a restore that would resolve a different package fails. After changing a package, run `dotnet restore` and commit the updated lock files.
+- `global.json` pins the exact SDK, and the Dockerfile builds with the SDK image of the same version.
+- Both base images are pinned by digest.
+- `NuGet.Config` clears machine-level sources, so only nuget.org is used.
+- Dependabot proposes weekly updates for packages, base images and GitHub Actions.
+
 ## Potential enhancements
 
 - **Distributed rate limiting**: limits are enforced per instance; a shared limit across instances would need a Redis-backed limiter or enforcement at the gateway.
 - **Incremental refresh**: every refresh fetches every item, because scores change. Hacker News's `/v0/updates.json` lists recently changed items, which would allow refetching only those between periodic full refreshes and cut upstream traffic substantially.
 - **Fencing for lost leases**: if a refresh outlives its lease (for example after a long pause that stops renewal), two instances can briefly refresh at once. Both publish complete snapshots, so the effect is extra upstream load rather than inconsistent data; a fencing token on the snapshot write would remove it.
-- **Readiness during Redis outages**: readiness currently fails when Redis is unreachable, which takes every instance out of rotation at once. An alternative is to keep instances ready and serve their last local snapshot during a short outage.
 - **Load testing**: add a load test (for example with k6 or NBomber) to verify throughput and latency targets and to tune the rate limit and client cache max-age.
 - **Deployment**: infrastructure as code for the chosen platform, probes wired to the health endpoints, dashboards, and alerts on refresh failures, staleness, skipped items and cooldown rejections.
-- **Supply chain**: dependency update automation (Dependabot or Renovate), container image scanning and an SBOM in CI.
+- **Supply chain**: container image scanning and an SBOM in CI.
 - **Administration**: authenticated endpoints to force a refresh or clear the cache, if operational needs justify them.

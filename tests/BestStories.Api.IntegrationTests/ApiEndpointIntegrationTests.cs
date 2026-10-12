@@ -177,7 +177,8 @@ public sealed class ApiEndpointIntegrationTests
 
         // Then
         await AssertProblemDetailsAsync(stories, HttpStatusCode.ServiceUnavailable);
-        Assert.NotNull(stories.Headers.RetryAfter);
+        // The initial load is still running, so there is no schedule to report: the default applies.
+        Assert.Equal(TimeSpan.FromSeconds(5), stories.Headers.RetryAfter?.Delta);
         await AssertProblemDetailsAsync(readiness, HttpStatusCode.ServiceUnavailable);
         Assert.Equal(HttpStatusCode.OK, liveness.StatusCode);
     }

@@ -174,7 +174,8 @@ public sealed class StoryProviderTests : IDisposable
             () => provider.GetSnapshotAsync(TestContext.Current.CancellationToken));
 
         // Then
-        Assert.IsType<StoryDataUnavailableException>(exception);
+        var unavailable = Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.Equal(TimeSpan.FromSeconds(20), unavailable.RetryAfter);
         Assert.Equal(1, _client.ListRequests);
     }
 
@@ -343,7 +344,8 @@ public sealed class StoryProviderTests : IDisposable
         _client.ReleaseListResponses();
 
         // Then
-        Assert.IsType<StoryDataUnavailableException>(exception);
+        var unavailable = Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.Equal(TimeSpan.FromSeconds(5), unavailable.RetryAfter);
         Assert.True(_timeProvider.GetUtcNow() - _start < TimeSpan.FromSeconds(60));
         await Eventually.HoldsAsync(async () =>
             await _cache.GetSnapshotAsync(TestContext.Current.CancellationToken) is not null);
@@ -376,6 +378,56 @@ public sealed class StoryProviderTests : IDisposable
         Assert.Equal(1, refreshLock.Releases);
     }
 
+    [Fact]
+    public async Task GivenAFailedOnDemandRefresh_WhenTheRequestFails_ThenItIsToldToRetryAfterTheCooldown()
+    {
+        // Given
+        var provider = CreateProvider(settings => settings.FailureCooldownSeconds = 30);
+        _client.ListFailure = new HttpRequestException("Upstream failure.");
+
+        // When
+        var exception = await Record.ExceptionAsync(
+            () => provider.GetSnapshotAsync(TestContext.Current.CancellationToken));
+
+        // Then
+        var unavailable = Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.Equal(TimeSpan.FromSeconds(30), unavailable.RetryAfter);
+    }
+
+    [Fact]
+    public async Task GivenAutomaticRefreshWithNoAcceptableSnapshot_WhenStoriesAreRequested_ThenTheyAreToldToRetryAtTheNextScheduledAttempt()
+    {
+        // Given
+        var schedule = new RefreshSchedule(_timeProvider);
+        schedule.SetNextAttempt(_timeProvider.GetUtcNow() + TimeSpan.FromSeconds(120));
+        var provider = CreateProvider(settings => settings.AutomaticRefresh = true, schedule: schedule);
+
+        // When
+        var exception = await Record.ExceptionAsync(
+            () => provider.GetSnapshotAsync(TestContext.Current.CancellationToken));
+
+        // Then
+        var unavailable = Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.Equal(TimeSpan.FromSeconds(120), unavailable.RetryAfter);
+    }
+
+    [Fact]
+    public async Task GivenAutomaticRefreshWhileAnAttemptIsRunning_WhenStoriesAreRequested_ThenNoRetryEstimateIsGiven()
+    {
+        // Given
+        var schedule = new RefreshSchedule(_timeProvider);
+        schedule.AttemptStarted();
+        var provider = CreateProvider(settings => settings.AutomaticRefresh = true, schedule: schedule);
+
+        // When
+        var exception = await Record.ExceptionAsync(
+            () => provider.GetSnapshotAsync(TestContext.Current.CancellationToken));
+
+        // Then
+        var unavailable = Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.Null(unavailable.RetryAfter);
+    }
+
     private async Task<StorySnapshot> PublishAsync(TimeSpan age)
     {
         var snapshot = TestStories.Snapshot(_timeProvider.GetUtcNow() - age, 100, 200);
@@ -388,7 +440,8 @@ public sealed class StoryProviderTests : IDisposable
         IDistributedRefreshLock? refreshLock = null,
         TimeProvider? timeProvider = null,
         FakeHackerNewsClient? client = null,
-        Action<DistributedCacheOptions>? configureLock = null)
+        Action<DistributedCacheOptions>? configureLock = null,
+        RefreshSchedule? schedule = null)
     {
         var settings = new StoryCacheOptions
         {
@@ -419,6 +472,7 @@ public sealed class StoryProviderTests : IDisposable
             Options.Create(lockSettings),
             time,
             _lifetime,
+            schedule ?? new RefreshSchedule(time),
             NullLogger<StoryProvider>.Instance);
     }
 

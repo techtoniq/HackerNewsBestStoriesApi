@@ -71,9 +71,7 @@ public sealed partial class HackerNewsV0Client(
             throw new InvalidDataException($"Hacker News returned an invalid time for story {id}.", exception);
         }
 
-        var url = string.IsNullOrWhiteSpace(item.Url)
-            ? string.Create(CultureInfo.InvariantCulture, $"https://news.ycombinator.com/item?id={id}")
-            : item.Url;
+        var url = GetWebUrl(item.Url, id);
 
         return new Story(
             id,
@@ -84,6 +82,37 @@ public sealed partial class HackerNewsV0Client(
             item.Score.Value,
             item.Descendants ?? 0);
     }
+
+    /// <summary>
+    /// Returns the story's own URL when it is an absolute <c>http</c> or <c>https</c> URL, and
+    /// otherwise its Hacker News item page. Anything else (<c>javascript:</c>, <c>data:</c>, relative
+    /// or malformed values) would be unsafe for clients that render <c>uri</c> as a link.
+    /// </summary>
+    private string GetWebUrl(string? url, int id)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return ItemPageUrl(id);
+        }
+
+        // The original string is returned unchanged; only its scheme and shape are checked.
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+            (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp))
+        {
+            return url;
+        }
+
+        LogUnsafeUrl(logger, id);
+        return ItemPageUrl(id);
+    }
+
+    private static string ItemPageUrl(int id) =>
+        string.Create(CultureInfo.InvariantCulture, $"https://news.ycombinator.com/item?id={id}");
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Story {StoryId} has a URL that is not an absolute HTTP or HTTPS URL; using its Hacker News page instead.")]
+    private static partial void LogUnsafeUrl(ILogger logger, int storyId);
 
     [LoggerMessage(
         Level = LogLevel.Warning,

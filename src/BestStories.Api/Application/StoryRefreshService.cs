@@ -10,6 +10,7 @@ namespace BestStories.Api.Application;
 public sealed partial class StoryRefreshService(
     IStoryProvider storyProvider,
     IOptions<StoryCacheOptions> options,
+    RefreshSchedule refreshSchedule,
     TimeProvider timeProvider,
     ILogger<StoryRefreshService> logger) : BackgroundService
 {
@@ -28,9 +29,13 @@ public sealed partial class StoryRefreshService(
             await LoadInitialSnapshotAsync(settings, stoppingToken);
 
             using var timer = new PeriodicTimer(settings.RefreshInterval, timeProvider);
+            refreshSchedule.SetNextAttempt(timeProvider.GetUtcNow() + settings.RefreshInterval);
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
+                var tickedAt = timeProvider.GetUtcNow();
+                refreshSchedule.AttemptStarted();
                 await TryRefreshAsync(stoppingToken);
+                refreshSchedule.SetNextAttempt(tickedAt + settings.RefreshInterval);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -44,10 +49,13 @@ public sealed partial class StoryRefreshService(
         var maximumDelay = TimeSpan.FromSeconds(settings.InitialLoadMaxRetryDelaySeconds);
         var delay = InitialRetryDelay < maximumDelay ? InitialRetryDelay : maximumDelay;
 
+        refreshSchedule.AttemptStarted();
         while (!await TryRefreshAsync(stoppingToken))
         {
             LogInitialLoadRetry(logger, delay.TotalSeconds);
+            refreshSchedule.SetNextAttempt(timeProvider.GetUtcNow() + delay);
             await Task.Delay(delay, timeProvider, stoppingToken);
+            refreshSchedule.AttemptStarted();
 
             var doubled = delay * 2;
             delay = doubled < maximumDelay ? doubled : maximumDelay;

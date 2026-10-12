@@ -4,6 +4,7 @@ using BestStories.Api.Domain;
 using BestStories.Api.Infrastructure.Caching;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
 
@@ -68,7 +69,7 @@ public sealed class RedisStoryCacheTests(RedisFixture redis)
     }
 
     [Fact]
-    public async Task GivenACorruptSharedSnapshot_WhenTheCacheIsRead_ThenInvalidDataIsReported()
+    public async Task GivenACorruptSharedSnapshot_WhenTheCacheIsRead_ThenItIsTreatedAsMissing()
     {
         // Given
         await CreateDistributedCache().SetAsync(
@@ -79,11 +80,11 @@ public sealed class RedisStoryCacheTests(RedisFixture redis)
         var cache = CreateCache();
 
         // When
-        var exception = await Record.ExceptionAsync(
-            () => cache.GetSnapshotAsync(TestContext.Current.CancellationToken));
+        var snapshot = await cache.GetSnapshotAsync(TestContext.Current.CancellationToken);
 
         // Then
-        Assert.IsType<InvalidDataException>(exception);
+        // Treating it as missing lets the next refresh overwrite it instead of every read failing.
+        Assert.Null(snapshot);
     }
 
     private RedisCache CreateDistributedCache() =>
@@ -101,7 +102,8 @@ public sealed class RedisStoryCacheTests(RedisFixture redis)
                 InstanceName = _instanceName,
                 LocalCacheMilliseconds = localCacheMilliseconds
             }),
-            _timeProvider);
+            _timeProvider,
+            NullLogger<RedisStoryCache>.Instance);
 
     private static StorySnapshot CreateSnapshot(DateTimeOffset publishedAt, params (int Id, int Score)[] stories) =>
         StorySnapshot.Create(

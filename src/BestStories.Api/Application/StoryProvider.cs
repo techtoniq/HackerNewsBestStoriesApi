@@ -38,9 +38,16 @@ public sealed partial class StoryProvider(
     IOptions<DistributedCacheOptions> distributedCacheOptions,
     TimeProvider timeProvider,
     IHostApplicationLifetime applicationLifetime,
+    RefreshSchedule refreshSchedule,
     ILogger<StoryProvider> logger) : IStoryProvider
 {
     private const long NoFailure = long.MinValue;
+
+    /// <summary>
+    /// The <c>Retry-After</c> for a request that stopped waiting while the refresh carries on:
+    /// long enough not to hammer the instance, short enough to pick up the refresh soon after it lands.
+    /// </summary>
+    private static readonly TimeSpan OnDemandWaitRetryAfter = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Scheduled refreshes skip when another instance published within this fraction of the
@@ -49,6 +56,8 @@ public sealed partial class StoryProvider(
     private const double ScheduledFreshnessFraction = 0.9;
 
     private readonly Lock _refreshGate = new();
+    private readonly LogThrottle _readFailureLog = new(timeProvider);
+    private readonly LogThrottle _waitTimeoutLog = new(timeProvider);
     private Task? _refreshTask;
     private long _lastFailureTimestamp = NoFailure;
 
@@ -75,7 +84,14 @@ public sealed partial class StoryProvider(
         }
         catch (Exception exception)
         {
-            LogSnapshotReadFailed(logger, exception);
+            // Typically the shared cache is unreachable and this instance has no snapshot of its
+            // own to fall back on. That affects every request, so the log is throttled.
+            StoryTelemetry.ReadFailures.Add(1);
+            if (_readFailureLog.ShouldLog(out var suppressed))
+            {
+                LogSnapshotReadFailed(logger, exception, suppressed);
+            }
+
             throw new StoryDataUnavailableException("The story data is unavailable.", exception);
         }
     }
@@ -98,7 +114,7 @@ public sealed partial class StoryProvider(
         if (snapshot is not null && age <= settings.MaxStaleness)
         {
             RecordRead("stale");
-            if (!settings.AutomaticRefresh && !IsCoolingDown())
+            if (!settings.AutomaticRefresh && RemainingCooldown() is null)
             {
                 StartBackgroundRefresh();
             }
@@ -111,13 +127,19 @@ public sealed partial class StoryProvider(
         {
             throw new StoryDataUnavailableException(snapshot is null
                 ? "The story cache has not been initialized."
-                : "The story cache is older than the maximum staleness.");
+                : "The story cache is older than the maximum staleness.")
+            {
+                RetryAfter = refreshSchedule.TimeUntilNextAttempt()
+            };
         }
 
-        if (IsCoolingDown())
+        if (RemainingCooldown() is { } cooldown)
         {
             StoryTelemetry.CooldownRejections.Add(1);
-            throw new StoryDataUnavailableException("A recent refresh failed; waiting before trying again.");
+            throw new StoryDataUnavailableException("A recent refresh failed; waiting before trying again.")
+            {
+                RetryAfter = cooldown
+            };
         }
 
         try
@@ -128,9 +150,25 @@ public sealed partial class StoryProvider(
         catch (TimeoutException)
         {
             StoryTelemetry.OnDemandWaitTimeouts.Add(1);
-            LogOnDemandWaitTimedOut(logger, settings.OnDemandWait.TotalSeconds);
+            if (_waitTimeoutLog.ShouldLog(out var suppressed))
+            {
+                LogOnDemandWaitTimedOut(logger, settings.OnDemandWait.TotalSeconds, suppressed);
+            }
+
             throw new StoryDataUnavailableException(
-                "The story refresh did not finish in time; it continues in the background.");
+                "The story refresh did not finish in time; it continues in the background.")
+            {
+                RetryAfter = OnDemandWaitRetryAfter
+            };
+        }
+        catch (StoryDataUnavailableException exception)
+        {
+            // The refresh failed and the cooldown has started; the shared exception is not
+            // modified because every waiting request observes it.
+            throw new StoryDataUnavailableException(exception.Message, exception)
+            {
+                RetryAfter = RemainingCooldown()
+            };
         }
 
         return await ReadSnapshotAsync(cancellationToken)
@@ -331,11 +369,17 @@ public sealed partial class StoryProvider(
         return snapshot is not null && snapshot.AgeAt(timeProvider.GetUtcNow()) < freshFor;
     }
 
-    private bool IsCoolingDown()
+    /// <summary>The time left in the cooldown after a failed refresh, or <c>null</c> when there is none.</summary>
+    private TimeSpan? RemainingCooldown()
     {
         var failedAt = Interlocked.Read(ref _lastFailureTimestamp);
-        return failedAt != NoFailure &&
-            timeProvider.GetElapsedTime(failedAt) < options.Value.FailureCooldown;
+        if (failedAt == NoFailure)
+        {
+            return null;
+        }
+
+        var remaining = options.Value.FailureCooldown - timeProvider.GetElapsedTime(failedAt);
+        return remaining > TimeSpan.Zero ? remaining : null;
     }
 
     private void RecordFailure() =>
@@ -358,8 +402,10 @@ public sealed partial class StoryProvider(
         _ => throw new ArgumentOutOfRangeException(nameof(trigger))
     };
 
-    [LoggerMessage(Level = LogLevel.Error, Message = "Could not read the story cache.")]
-    private static partial void LogSnapshotReadFailed(ILogger logger, Exception exception);
+    [LoggerMessage(
+        Level = LogLevel.Error,
+        Message = "Could not read the story cache. {SuppressedCount} similar failures were not logged since the last one.")]
+    private static partial void LogSnapshotReadFailed(ILogger logger, Exception exception, long suppressedCount);
 
     [LoggerMessage(Level = LogLevel.Error, Message = "The shared story cache or refresh lock is unavailable.")]
     private static partial void LogSharedCacheFailed(ILogger logger, Exception exception);
@@ -371,8 +417,8 @@ public sealed partial class StoryProvider(
 
     [LoggerMessage(
         Level = LogLevel.Warning,
-        Message = "A request stopped waiting for the story refresh after {WaitSeconds} seconds; the refresh continues.")]
-    private static partial void LogOnDemandWaitTimedOut(ILogger logger, double waitSeconds);
+        Message = "A request stopped waiting for the story refresh after {WaitSeconds} seconds; the refresh continues. {SuppressedCount} similar timeouts were not logged since the last one.")]
+    private static partial void LogOnDemandWaitTimedOut(ILogger logger, double waitSeconds, long suppressedCount);
 
     [LoggerMessage(
         Level = LogLevel.Error,
