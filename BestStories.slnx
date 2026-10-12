@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="Dockerfile" />
+    <File Path="global.json" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/BestStories.Api/BestStories.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BestStories.Api.ComponentTests/BestStories.Api.ComponentTests.csproj" />
+    <Project Path="tests/BestStories.Api.IntegrationTests/BestStories.Api.IntegrationTests.csproj" />
+    <Project Path="tests/BestStories.Api.UnitTests/BestStories.Api.UnitTests.csproj" />
+  </Folder>
+</Solution>
