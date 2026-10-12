@@ -45,6 +45,11 @@ public sealed partial class StorySnapshotBuilder(
                 },
                 async (id, itemCancellationToken) =>
                 {
+                    if (abort.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
                     try
                     {
                         var story = await hackerNewsClient.GetStoryAsync(id, itemCancellationToken);
@@ -53,8 +58,15 @@ public sealed partial class StorySnapshotBuilder(
                             stories.Add(story);
                         }
                     }
-                    catch (Exception exception) when (!itemCancellationToken.IsCancellationRequested)
+                    catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
                     {
+                        if (abort.IsCancellationRequested)
+                        {
+                            // The refresh has already failed; requests still in flight end here
+                            // without being counted, whatever exception their cancellation produced.
+                            return;
+                        }
+
                         LogItemFailed(logger, exception, id);
                         if (Interlocked.Increment(ref failures) > maximumFailures)
                         {
