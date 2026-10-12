@@ -1,5 +1,5 @@
 using System.Text.Json;
-using BestStories.Api.Services;
+using BestStories.Api.Endpoints;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -14,13 +14,15 @@ public sealed class SafeExceptionHandlerTests
         // Given
         const string sensitiveMessage = "C:\\internal\\platform\\private-stack-trace";
         var handler = new SafeExceptionHandler(NullLogger<SafeExceptionHandler>.Instance);
-        using var services = new ServiceCollection()
+        await using var services = new ServiceCollection()
             .AddLogging()
             .AddProblemDetails()
             .BuildServiceProvider();
-        var context = new DefaultHttpContext();
-        context.RequestServices = services;
         await using var responseBody = new MemoryStream();
+        var context = new DefaultHttpContext
+        {
+            RequestServices = services
+        };
         context.Response.Body = responseBody;
 
         // When
@@ -39,9 +41,9 @@ public sealed class SafeExceptionHandlerTests
             responseBody,
             cancellationToken: TestContext.Current.CancellationToken);
         var response = document.RootElement.GetRawText();
-        Assert.Contains("An unexpected error occurred.", response);
-        Assert.Contains("The request could not be completed.", response);
-        Assert.DoesNotContain(sensitiveMessage, response);
-        Assert.DoesNotContain("stack", response, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("An unexpected error occurred.", response, StringComparison.Ordinal);
+        Assert.Contains("The request could not be completed.", response, StringComparison.Ordinal);
+        Assert.DoesNotContain(sensitiveMessage, response, StringComparison.Ordinal);
+        Assert.DoesNotContain(nameof(InvalidOperationException), response, StringComparison.Ordinal);
     }
 }
