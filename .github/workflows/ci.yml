@@ -17,30 +17,64 @@ jobs:
     name: Build and test
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
 
       - name: Restore
-        run: dotnet restore BestStories.slnx
+        run: |
+          set -o pipefail
+          dotnet restore BestStories.slnx 2>&1 | tee -a ci.log
 
       - name: Build
-        run: dotnet build BestStories.slnx --configuration Release --no-restore
+        run: |
+          set -o pipefail
+          dotnet build BestStories.slnx --configuration Release --no-restore 2>&1 | tee -a ci.log
 
       # Component tests start a real Redis container through Testcontainers,
       # using the Docker engine that GitHub-hosted Ubuntu runners provide.
       - name: Test
-        run: dotnet test --solution BestStories.slnx --configuration Release --no-build
+        run: |
+          set -o pipefail
+          dotnet test --solution BestStories.slnx --configuration Release --no-build 2>&1 | tee -a ci.log
+
+      # Surface the first errors as annotations so they are visible on the pull request
+      # without opening the raw log.
+      - name: Report errors
+        if: failure()
+        run: |
+          grep -E "error [A-Z]+[0-9]+|failed [A-Za-z]|Error Message:|Assert\." ci.log \
+            | sed -E 's/^.*(error [A-Z]+[0-9]+)/\1/' \
+            | sort -u \
+            | head -n 40 \
+            | while IFS= read -r line; do echo "::error::${line}"; done
 
   container-image:
     name: Container image
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build image
-        run: docker build --tag beststories-api:ci .
+        run: |
+          set -o pipefail
+          docker build --progress=plain --tag beststories-api:ci . 2>&1 | tee docker.log
+
+      - name: Report errors
+        if: failure()
+        run: |
+          grep -E "error [A-Z]+[0-9]+|ERROR" docker.log \
+            | sed -E 's/^.*(error [A-Z]+[0-9]+)/\1/' \
+            | sort -u \
+            | head -n 40 \
+            | while IFS= read -r line; do echo "::error::${line}"; done
