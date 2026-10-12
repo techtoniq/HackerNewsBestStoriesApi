@@ -4,7 +4,7 @@ An ASP.NET Core (.NET 10) REST API that returns the best Hacker News stories in 
 
 ## Run locally
 
-Install the .NET 10 SDK (the version is pinned in `global.json`), then run from the repository root:
+Install the .NET 10 SDK named in `global.json` (10.0.401; later 10.0.4xx patches are also accepted), then run from the repository root:
 
 ```powershell
 dotnet run --project src\BestStories.Api
@@ -32,7 +32,7 @@ docker run --rm -p 8080:8080 beststories-api
 - The result can contain fewer than `n` items when fewer eligible stories exist.
 - Responses carry `ETag`, `Last-Modified` and `Cache-Control: public, max-age=…`. The max-age is whatever remains of the snapshot's freshness, capped at `ClientCacheMaxAgeSeconds` (60 by default). A request with a matching `If-None-Match` receives `304 Not Modified`.
 - `429 Too Many Requests` (with `Retry-After`) when a client exceeds the rate limit.
-- `503 Service Unavailable` (with `Retry-After`) when no snapshot within the maximum staleness is available. `Retry-After` reflects the cause: the time left in the failure cooldown, the time until the next scheduled refresh (automatic mode), or 5 seconds when a refresh is still running or no better estimate exists.
+- `503 Service Unavailable` (with `Retry-After`) when story data cannot be served: no snapshot within the maximum staleness is available, an on-demand request has waited `OnDemandWaitSeconds` for a refresh, the failure cooldown is in effect, or the story cache cannot be read and the instance has no snapshot of its own. `Retry-After` reflects the cause: the time left in the failure cooldown, the time until this instance's next scheduled refresh (automatic mode), or 5 seconds when a refresh is still running or no better estimate exists.
 
 The OpenAPI document is served at `/openapi/v1.json`.
 
@@ -48,9 +48,9 @@ The OpenAPI document is served at `/openapi/v1.json`.
 - `GET /health/ready` returns `200` when the instance can handle requests, otherwise a generic `503`:
   - Automatic refresh: ready once a snapshot is available (this instance's initial load, or one another instance published to Redis).
   - On-demand refresh: ready as soon as the story cache is reachable, because the first request populates it.
+  - In automatic mode, a snapshot older than `MaxStalenessSeconds` reports `{"status":"degraded"}` with `200`. Story requests return `503` meanwhile, but the instance stays in rotation: staleness comes from Hacker News and affects every instance alike, so failing readiness would only swap the API's `503` (with Problem Details and `Retry-After`) for the load balancer's and stall rolling deployments. Alert on the `beststories.cache.snapshot.age` metric instead.
   - With Redis configured, an instance that already holds a snapshot stays ready while Redis is unavailable (it serves that snapshot); only an instance with nothing to serve reports not ready.
   - The check times out after 2 seconds and then reports not ready.
-  - A snapshot older than `MaxStalenessSeconds` reports `{"status":"degraded"}` with `200`. Story requests return `503` meanwhile, but the instance stays in rotation: staleness comes from Hacker News and affects every instance alike, so failing readiness would only swap the API's `503` (with Problem Details and `Retry-After`) for the load balancer's and stall rolling deployments. Alert on the `beststories.cache.snapshot.age` metric instead.
 
 Use `/health/ready` as the readiness probe and `/health/live` as the liveness probe.
 
@@ -69,7 +69,7 @@ Requests are always served from a score-sorted snapshot of the Hacker News best 
 - Fresh and stale-but-acceptable snapshots are served immediately. In on-demand mode a stale snapshot also starts a refresh in the background (stale-while-revalidate), so requests do not wait for it.
 - Beyond the maximum staleness, or with no snapshot, on-demand requests wait for a refresh and automatic-mode requests receive `503`.
 - A failed refresh never replaces the last good snapshot.
-- After a failed on-demand refresh, requests that need one fail fast with `503` for `FailureCooldownSeconds` (30) instead of retrying Hacker News on every request.
+- After any failed refresh (on-demand, background or scheduled, including giving up on another instance's lease), on-demand requests that need a refresh fail fast with `503` for `FailureCooldownSeconds` (30) instead of retrying Hacker News on every request. Automatic mode never refreshes on request, so the cooldown does not affect it.
 - A refresh that has not finished within `RefreshTimeoutSeconds` (60) is abandoned and counts as a failure, so a Hacker News that is slow rather than failing cannot hold the refresh (and the Redis lease) indefinitely.
 - An on-demand request waits at most `OnDemandWaitSeconds` (10) for a refresh, then receives `503`; the refresh carries on in the background and later requests are served from it.
 
@@ -81,6 +81,8 @@ Requests are always served from a score-sorted snapshot of the Hacker News best 
 - **Coalescing**: concurrent requests on an instance share one in-flight refresh. Across instances, see below.
 - **Rate limiting**: each client address may make `RateLimiting:PermitLimit` (100) story requests per `WindowSeconds` (10) on each instance. IPv4 addresses mapped into IPv6 are limited as IPv4, and IPv6 clients by their /64 prefix so that rotating addresses within one subscriber's range does not bypass the limit.
 
+Deleted and dead stories are excluded. Stories without a URL, or whose URL is not an absolute `http` or `https` URL (for example `javascript:` or `data:`), use their Hacker News item page as `uri`; a missing comment count is returned as zero.
+
 ### Running behind a proxy or load balancer
 
 `X-Forwarded-For` and `X-Forwarded-Proto` are honoured only from loopback and the proxies listed under `ForwardedHeaders`; from anyone else they are ignored, so clients cannot spoof their address. **Configure this before deploying behind a load balancer or ingress.** Otherwise every client behind it shares the proxy's address and therefore one rate limit.
@@ -89,8 +91,6 @@ Requests are always served from a score-sorted snapshot of the Hacker News best 
 $env:ForwardedHeaders__KnownNetworks__0 = "10.0.0.0/16"   # for example, the ingress subnet
 $env:ForwardedHeaders__ForwardLimit = "1"                   # trusted proxies between client and service
 ```
-
-Deleted and dead stories are excluded. Stories without a URL, or whose URL is not an absolute `http` or `https` URL (for example `javascript:` or `data:`), use their Hacker News item page as `uri`; a missing comment count is returned as zero.
 
 ## Distributed cache (Redis)
 
@@ -112,11 +112,11 @@ With Redis:
 
 - All instances must use the same Redis deployment and `DistributedCache:InstanceName`.
 - The snapshot is shared through `IDistributedCache` under a versioned key (`best-stories:snapshot:v1`). Change the version when the snapshot format changes so that old and new versions do not read each other's snapshots during a rolling deployment.
-- Each instance reuses a snapshot it has read for `LocalCacheMilliseconds` (1000), so requests do not each read and deserialize it from Redis.
+- Each instance reuses a snapshot it has read or written for `LocalCacheMilliseconds` (1000), so requests do not each read and deserialize it from Redis.
 - A Redis lease (`SET NX` with an owner token) ensures only one instance refreshes at a time. The lease lasts `LockLeaseSeconds` (30) and is renewed by its owner every third of that period while the refresh runs. If the owner crashes, another instance can take over within one lease period. Renewal and release check the owner token, so an expired owner cannot extend or delete another instance's lease.
 - If a renewal finds another owner holding the lease, or renewals fail (including Redis timeouts) for a whole lease period, the owner abandons its refresh rather than racing the new owner. Failures to renew or release are logged and never fail a refresh that has already published; an unreleased lease simply expires.
-- Scheduled refreshes are skipped when another instance published within the current interval, so a fleet refreshes about once per interval rather than once per instance.
-- On-demand instances that find the lease held poll the shared cache every `LockPollMilliseconds` (200) for up to `LockWaitSeconds` (10), then return `503`.
+- A scheduled refresh is skipped when another instance holds the lease, or has published within 90% of the refresh interval, so a fleet refreshes about once per interval rather than once per instance.
+- When an on-demand refresh finds the lease held, it polls the shared cache every `LockPollMilliseconds` (200) for up to `LockWaitSeconds` (10) for the other instance's snapshot. Requests stop waiting after `OnDemandWaitSeconds` (10) and receive `503` while the polling carries on; if the lease is still held when `LockWaitSeconds` runs out, the attempt fails and the cooldown starts. Keep `OnDemandWaitSeconds` at least as long as `LockWaitSeconds` if requests should see the other instance's result.
 - The connection is made with `AbortOnConnectFail = false`, so the API starts while Redis is unreachable and reconnects in the background.
 - **Redis outages**: each instance keeps the last snapshot it read or wrote. If a Redis read fails or takes longer than `ReadTimeoutMilliseconds` (1000), that snapshot is served instead (still subject to `MaxStalenessSeconds`), and Redis is not tried again for `ReadFailureBackoffMilliseconds` (5000). An outage therefore costs each instance one slow read rather than one per request, and instances keep serving and stay ready. Only an instance that has never held a snapshot fails.
 - A shared snapshot that cannot be deserialized or fails validation (incomplete stories, duplicate IDs, wrong order, more than 500 stories) is treated as missing, so the next refresh replaces it.
@@ -157,7 +157,14 @@ Every setting can be overridden with environment variables, for example `StoryCa
 
 ## Observability
 
-The API is instrumented with OpenTelemetry: ASP.NET Core and outbound HTTP traces (health checks excluded), runtime, HTTP and API metrics, and structured logs. Custom telemetry covers cache reads (hit, stale or miss), refresh results and duration, refresh timeouts, on-demand wait timeouts, stories per refresh, skipped items, coalesced refreshes, cooldown rejections and the age of the newest snapshot (`beststories.cache.snapshot.age`, in seconds; alert when it exceeds `MaxStalenessSeconds`).
+The API is instrumented with OpenTelemetry: ASP.NET Core and outbound HTTP traces (health checks excluded), runtime, HTTP and API metrics, and structured logs. Custom telemetry (meter `BestStories.Api`) covers:
+
+- cache reads (hit, stale or miss), read failures and Redis fallbacks (`beststories.cache.read_failures`, `beststories.cache.shared.fallbacks`);
+- refresh results and duration, refresh timeouts, on-demand wait timeouts, stories per refresh, skipped items, coalesced refreshes and cooldown rejections;
+- shared snapshots rejected as corrupt or invalid (`beststories.cache.shared.rejected_snapshots`);
+- the age of the newest snapshot the instance has seen (`beststories.cache.snapshot.age`, in seconds). Warn at about twice `RefreshIntervalSeconds`, before clients are affected; story requests start returning `503` once it passes `MaxStalenessSeconds`.
+
+Failures that would otherwise be logged on every request (cache read failures, on-demand wait timeouts, Redis fallbacks and rejected snapshots) are logged at most once every 30 seconds, with the number of occurrences held back since the previous message; the metrics count every occurrence.
 
 - **Azure Application Insights**: set `APPLICATIONINSIGHTS_CONNECTION_STRING` (or `ApplicationInsights:ConnectionString`) through the platform's secret store.
 - **Any OTLP collector**: set the standard `OTEL_EXPORTER_OTLP_ENDPOINT`, plus `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` when the collector expects OTLP over HTTP rather than gRPC (the default). Traces, metrics and logs are exported, and the SDK appends the per-signal paths that HTTP/protobuf requires.
@@ -167,9 +174,9 @@ The API is instrumented with OpenTelemetry: ASP.NET Core and outbound HTTP trace
 
 The solution has three test projects:
 
-- **Unit tests**: the snapshot builder, provider, refresh service, client, health check and options validation, with a fake clock (`FakeTimeProvider`) instead of real delays.
-- **Integration tests**: the real application hosted in memory with `WebApplicationFactory`, with Hacker News replaced at the HTTP-handler level. The typed client, resilience pipeline, snapshot builder, provider, cache and endpoints all run for real. No network access or Redis is needed.
-- **Component tests**: the Redis cache and refresh lock against a real Redis container started by Testcontainers. These need a running Docker engine.
+- **Unit tests**: the snapshot builder, provider, refresh service, client, health check, options validation, rate-limit partitioning and log throttling, plus the failure handling of the Redis cache and refresh lock (timeouts, stalls, lost leases and corrupt payloads) against in-process fakes. A fake clock (`FakeTimeProvider`) replaces real delays.
+- **Integration tests**: the real application hosted in memory with `WebApplicationFactory`, with Hacker News replaced at the HTTP-handler level. The typed client, resilience pipeline, snapshot builder, provider, cache, forwarded-header handling, rate limiting and endpoints all run for real. No network access or Redis is needed.
+- **Component tests**: the Redis cache and refresh lock (including lease takeover) against a real Redis container started by Testcontainers. These need a running Docker engine.
 
 ```powershell
 dotnet test --project tests\BestStories.Api.UnitTests\BestStories.Api.UnitTests.csproj
@@ -183,7 +190,7 @@ Run all three with:
 dotnet test --solution BestStories.slnx
 ```
 
-All test projects use xUnit v3 on Microsoft Testing Platform. The GitHub Actions workflow (`.github/workflows/ci.yml`) builds the solution with warnings as errors, runs all three suites (component tests use the runner's Docker engine) and builds the container image on every pull request and push to `main`.
+All test projects use xUnit v3 on Microsoft Testing Platform. The GitHub Actions workflow (`.github/workflows/ci.yml`) restores in locked mode, builds the solution with warnings as errors, runs all three suites (component tests use the runner's Docker engine) and builds the container image on every pull request and push to `main`.
 
 ## Project structure
 
@@ -202,17 +209,21 @@ Build settings are shared through `Directory.Build.props` (nullable, warnings as
 Builds are reproducible:
 
 - Every project has a `packages.lock.json`, and CI and the container build restore in locked mode, so a restore that would resolve a different package fails. After changing a package, run `dotnet restore` and commit the updated lock files.
-- `global.json` pins the exact SDK, and the Dockerfile builds with the SDK image of the same version.
+- `global.json` names SDK 10.0.401 with `rollForward: latestPatch`. CI installs that version and the Dockerfile builds with the `sdk:10.0.401` image; developers may use a later 10.0.4xx patch. When updating the SDK image, update `global.json` to match.
 - Both base images are pinned by digest.
 - `NuGet.Config` clears machine-level sources, so only nuget.org is used.
-- Dependabot proposes weekly updates for packages, base images and GitHub Actions.
+- Dependabot proposes weekly updates for packages, base images (tag and digest) and GitHub Actions. If a package update does not include regenerated lock files, the locked-mode restore fails; run `dotnet restore` on the branch and push the updated `packages.lock.json` files.
 
 ## Potential enhancements
 
 - **Distributed rate limiting**: limits are enforced per instance; a shared limit across instances would need a Redis-backed limiter or enforcement at the gateway.
 - **Incremental refresh**: every refresh fetches every item, because scores change. Hacker News's `/v0/updates.json` lists recently changed items, which would allow refetching only those between periodic full refreshes and cut upstream traffic substantially.
-- **Fencing for lost leases**: if a refresh outlives its lease (for example after a long pause that stops renewal), two instances can briefly refresh at once. Both publish complete snapshots, so the effect is extra upstream load rather than inconsistent data; a fencing token on the snapshot write would remove it.
+- **Fencing for lost leases**: an owner abandons its refresh when a renewal finds another owner, or when renewals have failed for a whole lease period. A narrower window remains: a process paused between renewal checks (a long GC pause or a frozen VM) can still write one snapshot after its lease has expired. Both writes are complete snapshots, so the effect is a redundant write rather than inconsistent data; a fencing token checked on the snapshot write would close the window.
 - **Load testing**: add a load test (for example with k6 or NBomber) to verify throughput and latency targets and to tune the rate limit and client cache max-age.
-- **Deployment**: infrastructure as code for the chosen platform, probes wired to the health endpoints, dashboards, and alerts on refresh failures, staleness, skipped items and cooldown rejections.
-- **Supply chain**: container image scanning and an SBOM in CI.
+- **Deployment**: infrastructure as code for the chosen platform, probes wired to the health endpoints, dashboards, and alerts on `beststories.cache.snapshot.age`, refresh failures and timeouts (`beststories.cache.refreshes`, `beststories.cache.refresh.timeouts`), Redis fallbacks, rejected snapshots, read failures, skipped items and cooldown rejections.
+- **Supply chain**: container image scanning, an SBOM, and image signing with build provenance in CI.
+- **Configuration cross-checks**: validation does not yet relate settings to each other. `OnDemandWaitSeconds` shorter than `LockWaitSeconds` means requests stop waiting before another instance's refresh can be seen, and `MaxStalenessSeconds` should exceed `RefreshIntervalSeconds` plus `RefreshTimeoutSeconds` so that one slow refresh cannot push a healthy fleet into `503`s.
+- **Multiple replicas with the in-memory provider**: nothing warns when several replicas run with `DistributedCache:Provider = Memory`, in which case each replica polls Hacker News independently and serves its own snapshot (with its own ETags). A startup warning, or requiring an explicit provider outside Development, would catch it.
+- **OpenAPI exposure**: `/openapi/v1.json` is served in every environment; gate it on environment or configuration if the API is public.
+- **ETag versioning**: the ETag is derived from the snapshot and `n` only. Including a contract version would stop a deployment that changes the response shape from answering `304` to clients holding the old shape.
 - **Administration**: authenticated endpoints to force a refresh or clear the cache, if operational needs justify them.
