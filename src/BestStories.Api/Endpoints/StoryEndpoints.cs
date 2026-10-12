@@ -10,6 +10,9 @@ namespace BestStories.Api.Endpoints;
 
 public static class StoryEndpoints
 {
+    /// <summary>The <c>Retry-After</c> on a <c>503</c> whose cause gives no better estimate.</summary>
+    internal static readonly TimeSpan DefaultRetryAfter = TimeSpan.FromSeconds(5);
+
     public static IEndpointRouteBuilder MapStoryEndpoints(this IEndpointRouteBuilder endpoints)
     {
         ArgumentNullException.ThrowIfNull(endpoints);
@@ -52,9 +55,10 @@ public static class StoryEndpoints
         {
             snapshot = await storyProvider.GetSnapshotAsync(cancellationToken);
         }
-        catch (StoryDataUnavailableException)
+        catch (StoryDataUnavailableException exception)
         {
-            var retryAfterSeconds = Math.Max(1, settings.FailureCooldownSeconds);
+            var retryAfter = exception.RetryAfter ?? DefaultRetryAfter;
+            var retryAfterSeconds = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds));
             context.Response.Headers.RetryAfter = retryAfterSeconds.ToString(CultureInfo.InvariantCulture);
             return TypedResults.Problem(
                 statusCode: StatusCodes.Status503ServiceUnavailable,

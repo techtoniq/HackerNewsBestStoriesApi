@@ -30,7 +30,7 @@ jobs:
       - name: Restore
         run: |
           set -o pipefail
-          dotnet restore BestStories.slnx 2>&1 | tee -a ci.log
+          dotnet restore BestStories.slnx --locked-mode 2>&1 | tee -a ci.log
 
       - name: Build
         run: |

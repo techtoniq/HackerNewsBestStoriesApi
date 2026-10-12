@@ -14,6 +14,7 @@ public sealed class StoryRefreshServiceTests : IDisposable
     private readonly InMemoryStoryCache _cache = new();
     private readonly FakeHackerNewsClient _client = new();
     private readonly TestHostApplicationLifetime _lifetime = new();
+    private RefreshSchedule? _schedule;
 
     public void Dispose() => _lifetime.Dispose();
 
@@ -82,6 +83,37 @@ public sealed class StoryRefreshServiceTests : IDisposable
         await service.StopAsync(TestContext.Current.CancellationToken);
     }
 
+    [Fact]
+    public async Task GivenALoadedSnapshot_WhenTheScheduleIsInspected_ThenTheNextAttemptIsOneIntervalAway()
+    {
+        // Given
+        using var service = CreateService(automaticRefresh: true);
+
+        // When
+        await service.StartAsync(TestContext.Current.CancellationToken);
+        await Eventually.HoldsAsync(() => _schedule!.TimeUntilNextAttempt() is not null);
+
+        // Then
+        Assert.Equal(TimeSpan.FromSeconds(300), _schedule!.TimeUntilNextAttempt());
+        await service.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task GivenTheInitialLoadFails_WhenTheScheduleIsInspected_ThenTheNextAttemptIsTheRetryDelay()
+    {
+        // Given
+        _client.ListFailure = new HttpRequestException("Upstream failure.");
+        using var service = CreateService(automaticRefresh: true);
+
+        // When
+        await service.StartAsync(TestContext.Current.CancellationToken);
+        await Eventually.HoldsAsync(() => _schedule!.TimeUntilNextAttempt() is not null);
+
+        // Then
+        Assert.Equal(TimeSpan.FromSeconds(1), _schedule!.TimeUntilNextAttempt());
+        await service.StopAsync(TestContext.Current.CancellationToken);
+    }
+
     private StoryRefreshService CreateService(bool automaticRefresh)
     {
         var options = Options.Create(new StoryCacheOptions
@@ -96,6 +128,7 @@ public sealed class StoryRefreshServiceTests : IDisposable
             options,
             _timeProvider,
             NullLogger<StorySnapshotBuilder>.Instance);
+        _schedule = new RefreshSchedule(_timeProvider);
         var provider = new StoryProvider(
             builder,
             _cache,
@@ -104,11 +137,13 @@ public sealed class StoryRefreshServiceTests : IDisposable
             Options.Create(new DistributedCacheOptions()),
             _timeProvider,
             _lifetime,
+            _schedule,
             NullLogger<StoryProvider>.Instance);
 
         return new StoryRefreshService(
             provider,
             options,
+            _schedule,
             _timeProvider,
             NullLogger<StoryRefreshService>.Instance);
     }

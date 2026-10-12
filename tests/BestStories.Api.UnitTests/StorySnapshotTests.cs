@@ -65,4 +65,45 @@ public sealed class StorySnapshotTests
         // Then
         Assert.Same(stored, snapshot);
     }
+
+    [Fact]
+    public void GivenASnapshotFromCreate_WhenItIsValidated_ThenItIsValid()
+    {
+        // Given
+        var snapshot = TestStories.Snapshot(DateTimeOffset.UnixEpoch, 3, 1, 2);
+
+        // When
+        var valid = StorySnapshot.IsValid(snapshot, out var problem);
+
+        // Then
+        Assert.True(valid);
+        Assert.Null(problem);
+    }
+
+    [Fact]
+    public void GivenDuplicateStoryIds_WhenTheSnapshotIsValidated_ThenItIsInvalid()
+    {
+        // Given
+        var snapshot = new StorySnapshot([TestStories.Create(1, score: 5), TestStories.Create(1, score: 5)], DateTimeOffset.UnixEpoch);
+
+        // When
+        var valid = StorySnapshot.IsValid(snapshot, out var problem);
+
+        // Then
+        Assert.False(valid);
+        Assert.NotNull(problem);
+    }
+
+    [Fact]
+    public void GivenMoreStoriesThanTheMaximum_WhenTheSnapshotIsValidated_ThenItIsInvalid()
+    {
+        // Given
+        var snapshot = TestStories.Snapshot(DateTimeOffset.UnixEpoch, [.. Enumerable.Range(1, StoryLimits.MaximumCount + 1)]);
+
+        // When
+        var valid = StorySnapshot.IsValid(snapshot, out _);
+
+        // Then
+        Assert.False(valid);
+    }
 }

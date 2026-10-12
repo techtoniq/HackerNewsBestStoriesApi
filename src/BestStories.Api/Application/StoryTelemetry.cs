@@ -39,6 +39,18 @@ public static class StoryTelemetry
     public static readonly Counter<long> OnDemandWaitTimeouts =
         Meter.CreateCounter<long>("beststories.cache.refresh.wait_timeouts");
 
+    /// <summary>Story requests that failed because no snapshot could be read at all.</summary>
+    public static readonly Counter<long> ReadFailures =
+        Meter.CreateCounter<long>("beststories.cache.read_failures");
+
+    /// <summary>Reads served from this instance's last known snapshot because Redis failed or was too slow.</summary>
+    public static readonly Counter<long> SharedCacheFallbacks =
+        Meter.CreateCounter<long>("beststories.cache.shared.fallbacks");
+
+    /// <summary>Shared snapshots ignored because they could not be deserialized or failed validation.</summary>
+    public static readonly Counter<long> RejectedSnapshots =
+        Meter.CreateCounter<long>("beststories.cache.shared.rejected_snapshots");
+
     public static readonly Histogram<double> RefreshDuration =
         Meter.CreateHistogram<double>("beststories.cache.refresh.duration", "ms");
 

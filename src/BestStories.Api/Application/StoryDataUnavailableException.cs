@@ -19,4 +19,10 @@ public sealed class StoryDataUnavailableException : Exception
         : base(message, innerException)
     {
     }
+
+    /// <summary>
+    /// When it is worth asking again, for the <c>Retry-After</c> header, or <c>null</c> when the
+    /// cause gives no better estimate than the API's default.
+    /// </summary>
+    public TimeSpan? RetryAfter { get; init; }
 }

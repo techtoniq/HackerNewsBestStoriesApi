@@ -43,6 +43,8 @@ public sealed class OptionsValidationTests
     [InlineData("LockPollMilliseconds", "10000")]
     [InlineData("LocalCacheMilliseconds", "-1")]
     [InlineData("InstanceName", " ")]
+    [InlineData("ReadTimeoutMilliseconds", "0")]
+    [InlineData("ReadFailureBackoffMilliseconds", "-1")]
     public void GivenAnInvalidDistributedCacheSetting_WhenOptionsAreValidated_ThenValidationNamesTheSetting(
         string setting,
         string value)
@@ -161,6 +163,22 @@ public sealed class OptionsValidationTests
             Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor |
             Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto,
             options.ForwardedHeaders);
+    }
+
+    [Fact]
+    public void GivenTheServicesAreRegistered_WhenTheReadinessCheckIsInspected_ThenItHasATimeout()
+    {
+        // Given
+        using var services = CreateServices(new Dictionary<string, string?>());
+
+        // When
+        var registration = Assert.Single(
+            services.GetRequiredService<IOptions<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckServiceOptions>>()
+                .Value.Registrations);
+
+        // Then
+        Assert.Equal(TimeSpan.FromSeconds(2), registration.Timeout);
+        Assert.Equal(Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Unhealthy, registration.FailureStatus);
     }
 
     [Fact]

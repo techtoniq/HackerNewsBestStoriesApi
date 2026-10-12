@@ -152,4 +152,41 @@ public sealed class HackerNewsV0ClientTests
         new(
             new HttpClient(handler) { BaseAddress = HackerNewsV0Client.ApiBaseAddress },
             NullLogger<HackerNewsV0Client>.Instance);
+
+    [Theory]
+    [InlineData("javascript:alert(1)")]
+    [InlineData("data:text/html,<script>alert(1)</script>")]
+    [InlineData("/relative/path")]
+    [InlineData("ftp://example.com/file")]
+    [InlineData("not a url")]
+    public async Task GivenAStoryWithAnUnsafeUrl_WhenStoryDetailsAreFetched_ThenTheItemPageIsUsed(string url)
+    {
+        // Given
+        var json = $$"""{"id":42,"title":"A story","url":{{System.Text.Json.JsonSerializer.Serialize(url)}},"by":"author","time":1570887781,"score":12}""";
+        var client = CreateClient(StubHttpMessageHandler.Json(json));
+
+        // When
+        var story = await client.GetStoryAsync(42, TestContext.Current.CancellationToken);
+
+        // Then
+        Assert.NotNull(story);
+        Assert.Equal("https://news.ycombinator.com/item?id=42", story.Url);
+    }
+
+    [Theory]
+    [InlineData("https://example.com/a?b=c#d")]
+    [InlineData("http://example.com")]
+    public async Task GivenAStoryWithAnHttpUrl_WhenStoryDetailsAreFetched_ThenTheUrlIsKeptUnchanged(string url)
+    {
+        // Given
+        var json = $$"""{"id":42,"title":"A story","url":"{{url}}","by":"author","time":1570887781,"score":12}""";
+        var client = CreateClient(StubHttpMessageHandler.Json(json));
+
+        // When
+        var story = await client.GetStoryAsync(42, TestContext.Current.CancellationToken);
+
+        // Then
+        Assert.NotNull(story);
+        Assert.Equal(url, story.Url);
+    }
 }

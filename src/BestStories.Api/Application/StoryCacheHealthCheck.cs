@@ -11,8 +11,12 @@ namespace BestStories.Api.Application;
 /// <para>
 /// In automatic mode the instance is ready once a snapshot exists (its own initial load, or one
 /// another instance published to the shared cache). In on-demand mode it is ready as soon as it
-/// can reach the story cache, because the first request populates it. Reading the cache also
-/// makes Redis availability part of readiness when Redis is configured.
+/// can reach the story cache, because the first request populates it.
+/// </para>
+/// <para>
+/// With Redis, an instance that already holds a snapshot keeps serving it while Redis is
+/// unavailable (see <c>RedisStoryCache</c>), so a Redis outage only fails readiness for instances
+/// that have nothing to serve. The check is registered with a timeout as a backstop.
 /// </para>
 /// <para>
 /// A snapshot older than the maximum staleness reports <see cref="HealthStatus.Degraded"/>, which

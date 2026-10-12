@@ -116,6 +116,16 @@ public sealed class DistributedCacheOptionsValidator : IValidateOptions<Distribu
             failures.Add("DistributedCache:LocalCacheMilliseconds must not be negative.");
         }
 
+        if (options.ReadTimeoutMilliseconds <= 0)
+        {
+            failures.Add("DistributedCache:ReadTimeoutMilliseconds must be greater than zero.");
+        }
+
+        if (options.ReadFailureBackoffMilliseconds < 0)
+        {
+            failures.Add("DistributedCache:ReadFailureBackoffMilliseconds must not be negative.");
+        }
+
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
