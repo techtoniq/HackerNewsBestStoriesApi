@@ -7,18 +7,21 @@ public sealed class InMemoryRefreshLock : IDistributedRefreshLock, IDisposable
 {
     private readonly SemaphoreSlim _semaphore = new(1, 1);
 
-    public Task<IAsyncDisposable?> TryAcquireAsync(CancellationToken cancellationToken)
+    public Task<IRefreshLease?> TryAcquireAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        IAsyncDisposable? lease = _semaphore.Wait(0, cancellationToken) ? new Lease(_semaphore) : null;
+        IRefreshLease? lease = _semaphore.Wait(0, cancellationToken) ? new Lease(_semaphore) : null;
         return Task.FromResult(lease);
     }
 
     public void Dispose() => _semaphore.Dispose();
 
-    private sealed class Lease(SemaphoreSlim semaphore) : IAsyncDisposable
+    private sealed class Lease(SemaphoreSlim semaphore) : IRefreshLease
     {
         private int _released;
+
+        /// <summary>A process-local lease cannot be lost while the process is running.</summary>
+        public CancellationToken LeaseLost => CancellationToken.None;
 
         public ValueTask DisposeAsync()
         {

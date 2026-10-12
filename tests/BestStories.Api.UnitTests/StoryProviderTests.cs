@@ -17,6 +17,9 @@ public sealed class StoryProviderTests : IDisposable
     private readonly InMemoryStoryCache _cache = new();
     private readonly FakeHackerNewsClient _client = new();
     private readonly TestHostApplicationLifetime _lifetime = new();
+    private readonly DateTimeOffset _start;
+
+    public StoryProviderTests() => _start = _timeProvider.GetUtcNow();
 
     public void Dispose() => _lifetime.Dispose();
 
@@ -294,6 +297,85 @@ public sealed class StoryProviderTests : IDisposable
         Assert.Equal(0, _client.ListRequests);
     }
 
+    [Fact]
+    public async Task GivenAnUpstreamThatIsSlowButNotFailing_WhenARefreshRuns_ThenItIsAbandonedAtTheRefreshTimeout()
+    {
+        // Given
+        var provider = CreateProvider(settings =>
+        {
+            settings.AutomaticRefresh = true;
+            settings.RefreshIntervalSeconds = 300;
+            settings.RefreshTimeoutSeconds = 60;
+        });
+        _client.HoldListResponses();
+
+        // When
+        var refresh = provider.RefreshAsync(TestContext.Current.CancellationToken);
+        await _client.ListRequested.WaitAsync(SignalTimeout, TestContext.Current.CancellationToken);
+        await Eventually.HoldsAsync(
+            () => refresh.IsCompleted,
+            beforeEachCheck: () => _timeProvider.Advance(TimeSpan.FromSeconds(5)));
+        var exception = await Record.ExceptionAsync(() => refresh);
+
+        // Then
+        Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.Null(await _cache.GetSnapshotAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task GivenARefreshThatOutlastsTheOnDemandWait_WhenStoriesAreRequested_ThenTheRequestFailsAndTheRefreshCompletesInTheBackground()
+    {
+        // Given
+        var provider = CreateProvider(settings =>
+        {
+            settings.OnDemandWaitSeconds = 10;
+            settings.RefreshTimeoutSeconds = 60;
+        });
+        _client.HoldListResponses();
+
+        // When
+        var request = provider.GetSnapshotAsync(TestContext.Current.CancellationToken);
+        await _client.ListRequested.WaitAsync(SignalTimeout, TestContext.Current.CancellationToken);
+        await Eventually.HoldsAsync(
+            () => request.IsCompleted,
+            beforeEachCheck: () => _timeProvider.Advance(TimeSpan.FromSeconds(1)));
+        var exception = await Record.ExceptionAsync(() => request);
+        _client.ReleaseListResponses();
+
+        // Then
+        Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.True(_timeProvider.GetUtcNow() - _start < TimeSpan.FromSeconds(60));
+        await Eventually.HoldsAsync(async () =>
+            await _cache.GetSnapshotAsync(TestContext.Current.CancellationToken) is not null);
+        Assert.Equal(1, _client.ListRequests);
+    }
+
+    [Fact]
+    public async Task GivenTheRefreshLockIsLost_WhenARefreshIsRunning_ThenTheRefreshIsAbandoned()
+    {
+        // Given
+        using var refreshLock = new LosableRefreshLock();
+        var provider = CreateProvider(
+            settings =>
+            {
+                settings.AutomaticRefresh = true;
+                settings.RefreshIntervalSeconds = 300;
+            },
+            refreshLock: refreshLock);
+        _client.HoldListResponses();
+        var refresh = provider.RefreshAsync(TestContext.Current.CancellationToken);
+        await _client.ListRequested.WaitAsync(SignalTimeout, TestContext.Current.CancellationToken);
+
+        // When
+        await refreshLock.LoseAsync();
+        var exception = await Record.ExceptionAsync(() => refresh);
+
+        // Then
+        Assert.IsType<StoryDataUnavailableException>(exception);
+        Assert.Null(await _cache.GetSnapshotAsync(TestContext.Current.CancellationToken));
+        Assert.Equal(1, refreshLock.Releases);
+    }
+
     private async Task<StorySnapshot> PublishAsync(TimeSpan age)
     {
         var snapshot = TestStories.Snapshot(_timeProvider.GetUtcNow() - age, 100, 200);
@@ -338,5 +420,32 @@ public sealed class StoryProviderTests : IDisposable
             time,
             _lifetime,
             NullLogger<StoryProvider>.Instance);
+    }
+
+    /// <summary>A refresh lock whose lease the test can mark as lost.</summary>
+    private sealed class LosableRefreshLock : IDistributedRefreshLock, IDisposable
+    {
+        private readonly CancellationTokenSource _lost = new();
+        private int _releases;
+
+        public int Releases => Volatile.Read(ref _releases);
+
+        public Task<IRefreshLease?> TryAcquireAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IRefreshLease?>(new Lease(this));
+
+        public Task LoseAsync() => _lost.CancelAsync();
+
+        public void Dispose() => _lost.Dispose();
+
+        private sealed class Lease(LosableRefreshLock owner) : IRefreshLease
+        {
+            public CancellationToken LeaseLost => owner._lost.Token;
+
+            public ValueTask DisposeAsync()
+            {
+                Interlocked.Increment(ref owner._releases);
+                return ValueTask.CompletedTask;
+            }
+        }
     }
 }

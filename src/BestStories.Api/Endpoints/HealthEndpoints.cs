@@ -26,9 +26,13 @@ public static class HealthEndpoints
         return endpoints;
     }
 
+    /// <summary>
+    /// <c>Unhealthy</c> returns <c>503</c>. <c>Degraded</c> returns <c>200</c> so the instance stays in
+    /// rotation, with the status in the body for anyone looking.
+    /// </summary>
     private static Task WriteHealthResponse(HttpContext context, HealthReport report)
     {
-        if (report.Status != HealthStatus.Healthy)
+        if (report.Status == HealthStatus.Unhealthy)
         {
             return Results.Problem(
                 statusCode: StatusCodes.Status503ServiceUnavailable,
@@ -37,6 +41,7 @@ public static class HealthEndpoints
                 .ExecuteAsync(context);
         }
 
-        return Results.Json(new { status = "healthy" }).ExecuteAsync(context);
+        var status = report.Status == HealthStatus.Degraded ? "degraded" : "healthy";
+        return Results.Json(new { status }).ExecuteAsync(context);
     }
 }

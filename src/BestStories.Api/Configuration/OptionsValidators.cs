@@ -1,3 +1,4 @@
+using System.Net;
 using Microsoft.Extensions.Options;
 
 namespace BestStories.Api.Configuration;
@@ -32,6 +33,16 @@ public sealed class StoryCacheOptionsValidator : IValidateOptions<StoryCacheOpti
         if (options.FailureCooldownSeconds < 0)
         {
             failures.Add("StoryCache:FailureCooldownSeconds must not be negative.");
+        }
+
+        if (options.RefreshTimeoutSeconds <= 0)
+        {
+            failures.Add("StoryCache:RefreshTimeoutSeconds must be greater than zero.");
+        }
+
+        if (options.OnDemandWaitSeconds <= 0)
+        {
+            failures.Add("StoryCache:OnDemandWaitSeconds must be greater than zero.");
         }
 
         if (options.InitialLoadMaxRetryDelaySeconds <= 0)
@@ -126,6 +137,40 @@ public sealed class RateLimitingOptionsValidator : IValidateOptions<RateLimiting
         if (options.WindowSeconds <= 0)
         {
             failures.Add("RateLimiting:WindowSeconds must be greater than zero.");
+        }
+
+        return failures.Count == 0
+            ? ValidateOptionsResult.Success
+            : ValidateOptionsResult.Fail(failures);
+    }
+}
+
+public sealed class TrustedProxyOptionsValidator : IValidateOptions<TrustedProxyOptions>
+{
+    public ValidateOptionsResult Validate(string? name, TrustedProxyOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var failures = new List<string>();
+
+        foreach (var proxy in options.KnownProxies)
+        {
+            if (!IPAddress.TryParse(proxy, out _))
+            {
+                failures.Add($"ForwardedHeaders:KnownProxies contains '{proxy}', which is not an IP address.");
+            }
+        }
+
+        foreach (var network in options.KnownNetworks)
+        {
+            if (!IPNetwork.TryParse(network, out _))
+            {
+                failures.Add($"ForwardedHeaders:KnownNetworks contains '{network}', which is not a CIDR network.");
+            }
+        }
+
+        if (options.ForwardLimit < 1)
+        {
+            failures.Add("ForwardedHeaders:ForwardLimit must be at least 1.");
         }
 
         return failures.Count == 0
