@@ -2,6 +2,7 @@ using BestStories.Api.ComponentTests.TestSupport;
 using BestStories.Api.Configuration;
 using BestStories.Api.Domain;
 using BestStories.Api.Infrastructure.Caching;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
@@ -73,6 +74,7 @@ public sealed class RedisStoryCacheTests(RedisFixture redis)
         await CreateDistributedCache().SetAsync(
             RedisStoryCache.SnapshotKey,
             "not json"u8.ToArray(),
+            new DistributedCacheEntryOptions(),
             TestContext.Current.CancellationToken);
         var cache = CreateCache();
 
