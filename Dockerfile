@@ -15,7 +15,7 @@ RUN dotnet publish src/BestStories.Api/BestStories.Api.csproj \
 
 # Chiseled images contain only the runtime and its dependencies (no shell or package manager)
 # and run as a non-root user by default.
-FROM mcr.microsoft.com/dotnet/aspnet:10.0.12-noble-chiseled@sha256:48e51f2f6798897be7ac4e775c049ed8fe60d3190f637e1f9c9dc7513efa659c AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0.13-noble-chiseled@sha256:84def277556c2843a44fdeefbd3145d0a2e32d8f736d0c1a7b0a96b2880b0187 AS runtime
 WORKDIR /app
 COPY --from=build /app/publish .
 USER $APP_UID
