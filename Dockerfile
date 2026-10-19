@@ -1,7 +1,7 @@
 # The SDK image is pinned to the exact version in global.json, so CI and container builds use
 # the same SDK, and both images are pinned by digest so a rebuild cannot silently pick up a
 # different base. Dependabot proposes updates to the tag and digest together.
-FROM mcr.microsoft.com/dotnet/sdk:10.0.401@sha256:e70cdb7f80b0348f5cb85f19a8f670fca061f033d57eed12fa003d58b0e06317 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0.402@sha256:0d99ebf1ccad15037b5c98c9fe8979d6b8dbac23812feae2277a0b277b5c5ffa AS build
 WORKDIR /src
 COPY global.json NuGet.Config Directory.Build.props Directory.Packages.props ./
 COPY src/BestStories.Api/BestStories.Api.csproj src/BestStories.Api/packages.lock.json src/BestStories.Api/
